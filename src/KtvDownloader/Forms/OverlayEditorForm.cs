@@ -44,6 +44,7 @@ namespace KtvDownloader.Forms
         private CheckBox _chkBurnOnDownload;
         private CheckBox _chkShowAllWindows;
         private ComboBox _cboEncoder;
+        private Label _lblEncoderHint;
         private ComboBox _cboPreset;
         private NumericUpDown _numCrf;
         private Button _btnSample;
@@ -119,6 +120,9 @@ namespace KtvDownloader.Forms
 
             // 从预览窗口打开时，用真实视频的分辨率当画布比例；否则按 720p。
             BeginProbeVideoSize();
+
+            // 实测本机有哪些硬件编码器能用，把结论告诉用户。
+            BeginEncoderProbe();
         }
 
         #region 界面构建
@@ -178,7 +182,12 @@ namespace KtvDownloader.Forms
 
             Controls.Add(NewLabel("视频编码器", 12, 458, 76));
             _cboEncoder = NewCombo(88, 454, 130);
-            _cboEncoder.Items.AddRange(new object[] { "libx264", "h264_nvenc", "h264_qsv", "h264_amf" });
+            _cboEncoder.Items.AddRange(new object[]
+            {
+                // 「自动」是默认项，也是绝大多数人该用的：烧录时实测本机
+                // 哪个硬件编码器真能跑通就用哪个，都不行才回落 libx264。
+                AutoEncoderLabel, "libx264", "h264_nvenc", "h264_qsv", "h264_amf"
+            });
             _cboEncoder.SelectedIndexChanged += OnGlobalChanged;
             Controls.Add(_cboEncoder);
 
@@ -208,11 +217,16 @@ namespace KtvDownloader.Forms
 
             var lblCost = NewLabel(
                 "⚠ 烧录 = 整首重编码。视频从「流拷贝几秒」变成「解码+编码一两分钟」，哪怕叠加只出现 5 秒也一样。\r\n" +
-                "批量下载时建议把并发降到 1（两个 libx264 会吃满 CPU，反而更慢）。烧录失败不会丢掉歌曲，会保留无水印版本。",
+                "用 libx264（纯 CPU）批量下载时建议把并发降到 1，两个编码进程会吃满 CPU 反而更慢；\r\n" +
+                "用硬件编码器则不受此限，但消费级显卡的并发编码会话数有上限。烧录失败不会丢掉歌曲，会保留无水印版本。",
                 12, 520, 620);
             lblCost.Height = 46;
             lblCost.ForeColor = Color.FromArgb(180, 90, 40);
             Controls.Add(lblCost);
+
+            _lblEncoderHint = NewLabel(string.Empty, 12, 626, 620);
+            _lblEncoderHint.ForeColor = Color.FromArgb(30, 110, 60);
+            Controls.Add(_lblEncoderHint);
 
             var lblFidelity = NewLabel(
                 "预览用 GDI+ 排版，成品用 ffmpeg 的 libfreetype，字距会有几像素差异，描边已按 borderw 语义对齐。\r\n" +
@@ -530,7 +544,7 @@ namespace KtvDownloader.Forms
                 _chkShowInPreview.Checked = _working.ShowInPreview;
                 _chkBurnOnDownload.Checked = _working.BurnOnDownload;
 
-                SelectOrAdd(_cboEncoder, _working.VideoEncoder);
+                SelectOrAdd(_cboEncoder, EncoderToUi(_working.VideoEncoder));
                 SelectOrAdd(_cboPreset, _working.VideoPreset);
                 SetNumeric(_numCrf, _working.VideoCrf);
 
@@ -640,6 +654,28 @@ namespace KtvDownloader.Forms
             return luminance > 0.55 ? Color.Black : Color.White;
         }
 
+        /// <summary>下拉框里代表「自动」的那一项文字。</summary>
+        private const string AutoEncoderLabel = "自动（推荐）";
+
+        /// <summary>配置值 → 下拉框显示文字。</summary>
+        private static string EncoderToUi(string value)
+        {
+            return string.IsNullOrWhiteSpace(value) ||
+                   string.Equals(value, OverlayComposition.AutoEncoder, StringComparison.OrdinalIgnoreCase)
+                ? AutoEncoderLabel
+                : value;
+        }
+
+        /// <summary>下拉框显示文字 → 配置值。</summary>
+        private static string EncoderFromUi(string selected)
+        {
+            if (string.IsNullOrWhiteSpace(selected)) return OverlayComposition.AutoEncoder;
+
+            return string.Equals(selected, AutoEncoderLabel, StringComparison.Ordinal)
+                ? OverlayComposition.AutoEncoder
+                : selected;
+        }
+
         private static void SelectOrAdd(ComboBox combo, string value)
         {
             var index = combo.Items.IndexOf(value);
@@ -700,7 +736,7 @@ namespace KtvDownloader.Forms
             _working.Enabled = _chkEnabled.Checked;
             _working.ShowInPreview = _chkShowInPreview.Checked;
             _working.BurnOnDownload = _chkBurnOnDownload.Checked;
-            _working.VideoEncoder = _cboEncoder.SelectedItem as string ?? "libx264";
+            _working.VideoEncoder = EncoderFromUi(_cboEncoder.SelectedItem as string);
             _working.VideoPreset = _cboPreset.SelectedItem as string ?? "veryfast";
             _working.VideoCrf = (int)_numCrf.Value;
 
@@ -1196,6 +1232,62 @@ namespace KtvDownloader.Forms
             catch (Exception ex)
             {
                 if (_logger != null) _logger.Warn("探测样片分辨率失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 实测本机可用的硬件编码器，把结论显示在编码器下拉框下面。
+        /// <para>
+        /// 必须在后台跑：一次实测要给每个候选编码器跑一遍 64x64 的微编码，
+        /// 几百毫秒起步（nvenc 第一次初始化会话更慢），放在 UI 线程上
+        /// 打开对话框就会明显卡一下。
+        /// </para>
+        /// <para>
+        /// 结果只用于<b>告知</b>，不改用户的选择 —— 配置里存的是 <c>auto</c> 还是
+        /// 某个具体编码器，由用户在下拉框里决定；这里只是把"auto 到底会挑中谁"
+        /// 说出来，否则「自动」两个字对用户没有任何信息量。
+        /// </para>
+        /// </summary>
+        private async void BeginEncoderProbe()
+        {
+            if (_lblEncoderHint == null) return;
+
+            if (_mediaService == null)
+            {
+                _lblEncoderHint.Text = "（此入口没有媒体服务，无法实测；烧录时会自动实测）";
+                _lblEncoderHint.ForeColor = Color.Gray;
+                return;
+            }
+
+            _lblEncoderHint.Text = "正在实测本机可用的硬件编码器…";
+            _lblEncoderHint.ForeColor = Color.Gray;
+
+            try
+            {
+                var name = await _mediaService.SuggestVideoEncoderAsync().ConfigureAwait(true);
+
+                if (IsDisposed || _lblEncoderHint == null) return;
+
+                if (string.Equals(name, "libx264", StringComparison.OrdinalIgnoreCase))
+                {
+                    _lblEncoderHint.Text = "本机实测：没有可用的硬件编码器，「自动」会用 libx264（纯 CPU，最稳）";
+                    _lblEncoderHint.ForeColor = Color.Gray;
+                }
+                else
+                {
+                    _lblEncoderHint.Text = "本机实测：「自动」会用 " + name + "（硬件加速，比 libx264 快 5–10 倍）";
+                    _lblEncoderHint.ForeColor = Color.FromArgb(30, 110, 60);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (_logger != null) _logger.Warn("实测硬件编码器失败: " + ex.Message);
+
+                if (!IsDisposed && _lblEncoderHint != null)
+                {
+                    _lblEncoderHint.Text = "本机编码器实测失败，「自动」会用 libx264";
+                    _lblEncoderHint.ForeColor = Color.Gray;
+                }
             }
         }
 

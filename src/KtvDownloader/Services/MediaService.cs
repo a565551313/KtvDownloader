@@ -109,6 +109,17 @@ namespace KtvDownloader.Services
         /// <summary><c>ffmpeg -encoders</c> 的结果，只探测一次。</summary>
         private HashSet<string> _availableEncoders;
 
+        /// <summary>
+        /// 「这个编码器在本机实测能不能跑通」的结果，按编码器名缓存。
+        /// <para>和 <see cref="_availableEncoders"/> 是两件事：那边是"ffmpeg 编译进了它"，
+        /// 这边是"这台机器此刻真能用它"。见 <see cref="VerifyEncoder"/>。</para>
+        /// </summary>
+        private readonly Dictionary<string, bool> _verifiedEncoders =
+            new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary><see cref="SuggestVideoEncoder"/> 的结论，只算一次。</summary>
+        private string _suggestedEncoder;
+
         public MediaService(ILogger logger, string configuredFfmpegPath)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -142,6 +153,8 @@ namespace KtvDownloader.Services
                 _probed = false;
                 _probeCache.Clear();
                 _availableEncoders = null;   // 换了 ffmpeg 版本，编码器清单也得重探
+                _verifiedEncoders.Clear();   // 实测结论同样作废：新 ffmpeg 可能带不同的编码器
+                _suggestedEncoder = null;
             }
 
             _logger.Info("ffmpeg 路径已更新为 " +
@@ -468,8 +481,6 @@ namespace KtvDownloader.Services
                 return result;
             }
 
-            var encoder = ResolveEncoder(composition == null ? null : composition.VideoEncoder, result.Warnings);
-
             var plan = OverlayFilterBuilder.Build(
                 composition, probe.VideoWidth, probe.VideoHeight, _overlayAssets);
 
@@ -487,6 +498,11 @@ namespace KtvDownloader.Services
                 _logger.Warn("叠加层烧录跳过: " + result.Error);
                 return result;
             }
+
+            // 编码器解析放在 IsEmpty 检查**之后**：VideoEncoder 为 auto 时要逐个
+            // 真跑微编码来实测硬件编码器，最多要花上一秒。没什么可烧的时候
+            // 这一秒是纯浪费 —— 而这条路径本该是立刻返回的。
+            var encoder = ResolveEncoder(composition == null ? null : composition.VideoEncoder, result.Warnings);
 
             if (!_overlayAssets.WriteTextFiles(plan.TextFiles))
             {
@@ -661,16 +677,194 @@ namespace KtvDownloader.Services
         private string ResolveEncoder(string requested, List<string> warnings)
         {
             var name = (requested ?? string.Empty).Trim();
-            if (name.Length == 0 || string.Equals(name, "libx264", StringComparison.OrdinalIgnoreCase))
-                return "libx264";
+
+            // ── auto / 留空：实测后自动挑 ────────────────────────────────
+            // 这是默认路径，也是绝大多数用户会走的路径。
+            if (name.Length == 0 ||
+                string.Equals(name, OverlayComposition.AutoEncoder, StringComparison.OrdinalIgnoreCase))
+            {
+                var suggested = SuggestVideoEncoder();
+
+                if (!string.Equals(suggested, "libx264", StringComparison.OrdinalIgnoreCase))
+                {
+                    var note = "自动选用硬件编码器 " + suggested + "（比 libx264 快 5–10 倍）";
+                    if (warnings != null && !warnings.Contains(note)) warnings.Add(note);
+                    _logger.Info(note);
+                }
+
+                return suggested;
+            }
+
+            // ── 用户显式钉死 libx264：尊重，不再自动切到硬编 ──────────────
+            // 否则"我明明选了软编它又自己开回硬编"这种行为没法解释。
+            if (string.Equals(name, "libx264", StringComparison.OrdinalIgnoreCase)) return "libx264";
 
             var available = GetAvailableEncoders();
-            if (available == null || available.Contains(name.ToLowerInvariant())) return name;
+            if (available != null && !available.Contains(name.ToLowerInvariant()))
+            {
+                return FallBack(warnings,
+                    string.Format("ffmpeg 不支持编码器「{0}」，已回落 libx264", name));
+            }
 
-            var message = string.Format("ffmpeg 不支持编码器「{0}」，已回落 libx264", name);
+            // 清单里有 ≠ 真能用（驱动太旧、没有对应显卡、nvenc 会话数被占满）。
+            // 不实测就照用户填的发命令，结果是 ffmpeg 在初始化编码器那一刻失败退出，
+            // 用户看到的只有"下载失败"，真正的原因埋在 stderr 里。
+            // 实测不通过就回落软编：慢一点，但成品拿得到。
+            if (FfmpegFilterText.IsHardwareEncoder(name) && !VerifyEncoder(name))
+            {
+                return FallBack(warnings,
+                    string.Format("编码器「{0}」在本机实测不可用，已回落 libx264", name));
+            }
+
+            return name;
+        }
+
+        private string FallBack(List<string> warnings, string message)
+        {
             if (warnings != null && !warnings.Contains(message)) warnings.Add(message);
             _logger.Warn(message);
             return "libx264";
+        }
+
+        /// <inheritdoc/>
+        public Task<string> SuggestVideoEncoderAsync()
+        {
+            return Task.Run(() => SuggestVideoEncoder());
+        }
+
+        /// <summary>
+        /// 硬件编码器的优先顺序（从高到低）。
+        /// <para>
+        /// nvenc 排第一：独显用户最多、驱动最稳。<c>h264_mf</c> 垫底兜底 ——
+        /// 它走 Windows Media Foundation，NVIDIA/AMD/Intel 的驱动都可能注册上来，
+        /// 所以就算前三个都没编译进 ffmpeg，它也有机会能用。
+        /// </para>
+        /// </summary>
+        internal static readonly string[] HardwareEncoderPreference =
+        {
+            "h264_nvenc",
+            "h264_qsv",
+            "h264_amf",
+            "h264_mf"
+        };
+
+        /// <summary>
+        /// 把"本机 ffmpeg 编译进了的编码器"按 <see cref="HardwareEncoderPreference"/>
+        /// 排成待实测的候选队列。<b>纯函数</b>，可单测。
+        /// <para>
+        /// 为什么要单独抽出来：自动挑编码器这件事最容易出错的地方就是优先级 ——
+        /// 挑错了用户拿到的是慢 10 倍的软编，而界面上看不出任何异常。
+        /// </para>
+        /// </summary>
+        internal static List<string> OrderEncoderCandidates(IEnumerable<string> available)
+        {
+            var result = new List<string>();
+            if (available == null) return result;
+
+            var pool = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var name in available)
+            {
+                if (!string.IsNullOrWhiteSpace(name)) pool.Add(name.Trim());
+            }
+
+            foreach (var candidate in HardwareEncoderPreference)
+            {
+                if (pool.Contains(candidate)) result.Add(candidate);
+            }
+
+            return result;
+        }
+
+        /// <inheritdoc/>
+        public string SuggestVideoEncoder()
+        {
+            lock (_probeLock)
+            {
+                if (_suggestedEncoder != null) return _suggestedEncoder;
+            }
+
+            var chosen = "libx264";
+
+            try
+            {
+                if (IsFfmpegAvailable)
+                {
+                    var available = GetAvailableEncoders();
+
+                    // 按优先级逐个实测，**第一个通过的就收工** ——
+                    // 不必把剩下的也测一遍，每次实测都是几百毫秒。
+                    foreach (var candidate in OrderEncoderCandidates(available))
+                    {
+                        if (VerifyEncoder(candidate))
+                        {
+                            chosen = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("自动挑选视频编码器失败，用 libx264: " + ex.Message);
+            }
+
+            lock (_probeLock)
+            {
+                _suggestedEncoder = chosen;
+                return _suggestedEncoder;
+            }
+        }
+
+        /// <summary>
+        /// 真跑一次微编码，验证这个编码器在<b>这台机器上此刻</b>能不能用。结果按名字缓存。
+        /// <para>
+        /// 64x64、5 帧，实测几百毫秒（nvenc 第一次初始化会话会慢一些）。
+        /// 输入用 <c>nullsrc</c> 由 lavfi 现造，不需要任何文件；输出用 <c>-f null</c> 丢掉。
+        /// </para>
+        /// <para>
+        /// ⚠️ 失败一律当"不能用"处理，包括 lavfi 缺失、超时、ffmpeg 崩了。
+        /// 这里宁可保守回落到 libx264（慢但一定能出成品），
+        /// 也不要赌一个没验证过的编码器把整次下载搞失败。
+        /// </para>
+        /// </summary>
+        private bool VerifyEncoder(string encoderName)
+        {
+            if (string.IsNullOrWhiteSpace(encoderName)) return false;
+
+            lock (_probeLock)
+            {
+                bool cached;
+                if (_verifiedEncoders.TryGetValue(encoderName, out cached)) return cached;
+            }
+
+            var works = false;
+
+            try
+            {
+                var arguments = "-hide_banner -loglevel error -f lavfi"
+                                + " -i nullsrc=size=64x64:rate=25:duration=0.2"
+                                + " -frames:v 5 -c:v " + encoderName
+                                + " -f null -";
+
+                var result = Run(arguments, ProbeTimeout, CancellationToken.None);
+                works = !result.TimedOut && result.ExitCode == 0;
+
+                if (!works)
+                {
+                    _logger.Info(string.Format("编码器 {0} 本机实测不可用（退出码 {1}）: {2}",
+                        encoderName, result.ExitCode, Tail(result.StdErr, 200)));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Info("验证编码器 " + encoderName + " 异常，当作不可用: " + ex.Message);
+            }
+
+            lock (_probeLock)
+            {
+                _verifiedEncoders[encoderName] = works;
+                return works;
+            }
         }
 
         /// <summary>

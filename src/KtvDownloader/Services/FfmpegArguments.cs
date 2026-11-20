@@ -224,7 +224,11 @@ namespace KtvDownloader.Services
         public static string BuildVideoEncoderOptions(string encoder, string preset, int crf)
         {
             var name = (encoder ?? string.Empty).Trim().ToLowerInvariant();
-            if (name.Length == 0) name = "libx264";
+
+            // "auto" 正常情况下到不了这里 —— MediaService.ResolveEncoder 会先把它
+            // 换成实测可用的具体编码器。但这是个 public 纯函数，别的调用方可能直接传，
+            // 拼出 -c:v auto 会让 ffmpeg 报"未知编码器"，所以在这里也兜一道。
+            if (name.Length == 0 || name == OverlayComposition.AutoEncoder) name = "libx264";
 
             var quality = ClampVideoCrf(crf).ToString(CultureInfo.InvariantCulture);
             var head = "-c:v " + name;

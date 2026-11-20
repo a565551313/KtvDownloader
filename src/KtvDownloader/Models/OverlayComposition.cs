@@ -24,15 +24,24 @@ namespace KtvDownloader.Models
         /// <summary>下载时是否真的烧进视频文件。</summary>
         public bool BurnOnDownload { get; set; } = true;
 
+        /// <summary>"交给程序实测后自动挑"的编码器取值，也是本项的默认值。</summary>
+        public const string AutoEncoder = "auto";
+
         /// <summary>
-        /// 视频编码器。默认 <c>libx264</c>（纯 CPU，所有机器都能跑）。
+        /// 视频编码器。默认 <see cref="AutoEncoder"/>：<b>烧录时实测本机哪个硬件编码器
+        /// 真能跑通就用哪个</b>，都不行才回落 <c>libx264</c>。
         /// <para>
-        /// 有独显可以填 <c>h264_nvenc</c>（NVIDIA）/ <c>h264_qsv</c>（Intel 核显）/
-        /// <c>h264_amf</c>（AMD），快 5–10 倍。填了不存在的编码器 ffmpeg 会直接失败，
-        /// 所以 <c>MediaService</c> 会先探测一次再决定用不用。
+        /// 也可以显式钉死一个：<c>libx264</c>（纯 CPU，最稳、同码率画质最好）、
+        /// <c>h264_nvenc</c>（NVIDIA）/ <c>h264_qsv</c>（Intel 核显）/ <c>h264_amf</c>（AMD），
+        /// 后三个快 5–10 倍。
+        /// </para>
+        /// <para>
+        /// ⚠️ <b>显式选了 <c>libx264</c> 就是明确的选择，程序不会再自动切到硬编。</b>
+        /// 否则"我明明关了硬编它又自己开回来"这种行为没法向用户解释。
+        /// 想恢复自动，把这一项设回 <c>auto</c>（界面上是「自动（推荐）」）。
         /// </para>
         /// </summary>
-        public string VideoEncoder { get; set; } = "libx264";
+        public string VideoEncoder { get; set; } = AutoEncoder;
 
         /// <summary>libx264 的速度档。越慢画质越好、耗时越长。硬编时忽略此项。</summary>
         public string VideoPreset { get; set; } = "veryfast";
@@ -122,7 +131,9 @@ namespace KtvDownloader.Models
             // 元素太多会让 filter_complex 长得离谱，也拖慢编码。20 个足够任何实际需求。
             if (Elements.Count > 20) Elements.RemoveRange(20, Elements.Count - 20);
 
-            VideoEncoder = string.IsNullOrWhiteSpace(VideoEncoder) ? "libx264" : VideoEncoder.Trim();
+            // 留空回落到"自动"而不是 libx264：留空意味着用户没表态，
+            // 没表态就该享受硬件加速；显式写了 libx264 才是"我要用 CPU"。
+            VideoEncoder = string.IsNullOrWhiteSpace(VideoEncoder) ? AutoEncoder : VideoEncoder.Trim();
             VideoPreset = NormalizePreset(VideoPreset);
             VideoCrf = VideoCrf < 0 ? 20 : (VideoCrf > 51 ? 20 : VideoCrf);
         }

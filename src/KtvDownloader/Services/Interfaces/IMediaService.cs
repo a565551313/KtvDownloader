@@ -90,6 +90,30 @@ namespace KtvDownloader.Services.Interfaces
             CancellationToken cancellationToken = default(CancellationToken));
 
         /// <summary>
+        /// 实测本机可用的最佳视频编码器，结果缓存（一个进程只测一次）。
+        /// <para>
+        /// 按 <c>h264_nvenc</c> → <c>h264_qsv</c> → <c>h264_amf</c> → <c>h264_mf</c>
+        /// 的顺序逐个<b>真跑一次微编码</b>，第一个通过的就是答案；全都不通过返回
+        /// <c>libx264</c>。ffmpeg 不可用时也返回 <c>libx264</c>。
+        /// </para>
+        /// <para>
+        /// 不能只看 <c>ffmpeg -encoders</c> 的清单：那只说明这个 ffmpeg 构建<b>编译进了</b>
+        /// 该编码器，不代表机器上有对应显卡、驱动够新、或者 nvenc 的并发会话数没被占满
+        /// （消费级卡有上限）。这些情况下 ffmpeg 会在初始化编码器那一刻失败退出，
+        /// 用户看到的只是"下载失败"。
+        /// </para>
+        /// </summary>
+        /// <returns>可直接传给 <c>FfmpegArguments.BuildVideoEncoderOptions</c> 的编码器名。</returns>
+        string SuggestVideoEncoder();
+
+        /// <summary>
+        /// <see cref="SuggestVideoEncoder"/> 的异步版。
+        /// <para>界面必须用这个：一次实测要给每个候选跑一遍 64x64 微编码，
+        /// 几百毫秒起步，放在 UI 线程上打开对话框就会卡一下。</para>
+        /// </summary>
+        Task<string> SuggestVideoEncoderAsync();
+
+        /// <summary>
         /// 把<b>已经烧好叠加层的视频流</b>与另一个文件的音轨合到一起，两边都流拷贝。
         /// <para>
         /// 给 <c>VocalOption.SplitBoth</c> 用：原唱版和伴奏版的画面完全相同

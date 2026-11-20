@@ -126,6 +126,109 @@ namespace KtvDownloader.Tests
             Assert.AreEqual(20, FfmpegArguments.ClampVideoCrf(20));
         }
 
+        // ── 自动挑选硬件编码器 ──────────────────────────────────────────
+        //
+        // 默认值是 "auto"：烧录时实测本机哪个硬件编码器真能跑通就用哪个。
+        // 挑错了不会报错，用户只是拿到慢 5–10 倍的软编，界面上看不出任何异常，
+        // 所以优先级这段必须钉住。
+
+        [TestMethod]
+        public void 自动_配置默认值就是auto()
+        {
+            // 新用户不该需要知道 h264_nvenc 是什么才能享受显卡加速。
+            Assert.AreEqual(OverlayComposition.AutoEncoder, new OverlayComposition().VideoEncoder);
+            Assert.AreEqual("auto", OverlayComposition.AutoEncoder);
+        }
+
+        [TestMethod]
+        public void 自动_留空回落到auto而不是libx264()
+        {
+            // 留空 = 用户没表态，没表态就该享受硬件加速。
+            var composition = new OverlayComposition { VideoEncoder = "   " };
+            composition.Normalize();
+            Assert.AreEqual(OverlayComposition.AutoEncoder, composition.VideoEncoder);
+
+            var nullEncoder = new OverlayComposition { VideoEncoder = null };
+            nullEncoder.Normalize();
+            Assert.AreEqual(OverlayComposition.AutoEncoder, nullEncoder.VideoEncoder);
+        }
+
+        [TestMethod]
+        public void 自动_显式选了libx264就必须尊重不再切回硬编()
+        {
+            // 否则"我明明选了软编它又自己开回硬编"这种行为没法向用户解释。
+            var composition = new OverlayComposition { VideoEncoder = "libx264" };
+            composition.Normalize();
+            Assert.AreEqual("libx264", composition.VideoEncoder);
+        }
+
+        [TestMethod]
+        public void 自动_优先级是nvenc然后qsv然后amf()
+        {
+            // 全都在时挑 nvenc（独显用户最多、驱动最稳）。
+            var all = MediaService.OrderEncoderCandidates(
+                new[] { "h264_amf", "h264_qsv", "h264_nvenc", "libx264" });
+
+            Assert.AreEqual(3, all.Count, "libx264 不该进硬件候选队列");
+            Assert.AreEqual("h264_nvenc", all[0]);
+            Assert.AreEqual("h264_qsv", all[1]);
+            Assert.AreEqual("h264_amf", all[2]);
+        }
+
+        [TestMethod]
+        public void 自动_没有nvenc时退而求其次()
+        {
+            // 实测是逐个来的，所以这里返回的是"待实测顺序"，
+            // SuggestVideoEncoder 会按这个顺序测，第一个通过的就收工。
+            var intel = MediaService.OrderEncoderCandidates(new[] { "h264_qsv", "libx264" });
+            Assert.AreEqual(1, intel.Count);
+            Assert.AreEqual("h264_qsv", intel[0]);
+
+            var amd = MediaService.OrderEncoderCandidates(new[] { "h264_amf" });
+            Assert.AreEqual(1, amd.Count);
+            Assert.AreEqual("h264_amf", amd[0]);
+        }
+
+        [TestMethod]
+        public void 自动_纯软编机器得到空候选队列()
+        {
+            // 队列空 → SuggestVideoEncoder 直接返回 libx264，一次实测都不用跑。
+            Assert.AreEqual(0, MediaService.OrderEncoderCandidates(new[] { "libx264", "mpeg4" }).Count);
+            Assert.AreEqual(0, MediaService.OrderEncoderCandidates(new string[0]).Count);
+            Assert.AreEqual(0, MediaService.OrderEncoderCandidates(null).Count);
+        }
+
+        [TestMethod]
+        public void 自动_大小写和空白不影响识别()
+        {
+            var candidates = MediaService.OrderEncoderCandidates(
+                new[] { " H264_NVENC ", "h264_qsv" });
+
+            Assert.AreEqual(2, candidates.Count);
+            Assert.AreEqual("h264_nvenc", candidates[0], "应归一化成小写的规范名");
+        }
+
+        [TestMethod]
+        public void 自动_编码器参数拼装时auto当作libx264兜底()
+        {
+            // 正常路径下 ResolveEncoder 会先把 auto 换成具体编码器，
+            // 但 BuildVideoEncoderOptions 是 public 纯函数，别的调用方可能直接传，
+            // 拼出 -c:v auto 会让 ffmpeg 报"未知编码器"。
+            Assert.AreEqual("-c:v libx264 -preset veryfast -crf 20",
+                FfmpegArguments.BuildVideoEncoderOptions("auto", "veryfast", 20));
+            Assert.AreEqual("-c:v libx264 -preset veryfast -crf 20",
+                FfmpegArguments.BuildVideoEncoderOptions("AUTO", "veryfast", 20));
+        }
+
+        [TestMethod]
+        public void 自动_硬件编码器不吃crf和preset的软编写法()
+        {
+            // 传错 ffmpeg 会直接失败退出。nvenc 用 -cq，qsv 用 -global_quality。
+            var nvenc = FfmpegArguments.BuildVideoEncoderOptions("h264_nvenc", "veryfast", 20);
+            Assert.IsFalse(nvenc.Contains("-crf"), "nvenc 不认 -crf：" + nvenc);
+            Assert.IsTrue(nvenc.Contains("-cq 20"), nvenc);
+        }
+
         #endregion
 
         #region 烧录命令行
@@ -698,6 +801,7 @@ At least one output file must be specified";
                 Assert.IsTrue(loaded.ShowInPreview);
                 Assert.IsFalse(loaded.BurnOnDownload);
                 Assert.AreEqual("h264_nvenc", loaded.VideoEncoder);
+                // 显式选择的编码器必须原样往返，不能被"优化"成 auto。
                 Assert.AreEqual("medium", loaded.VideoPreset);
                 Assert.AreEqual(18, loaded.VideoCrf);
 
