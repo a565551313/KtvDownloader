@@ -330,6 +330,94 @@ namespace KtvDownloader.Infrastructure.Media
             return current >= 0 ? new[] { current } : new int[0];
         }
 
+        /// <summary>
+        /// 当前声道模式（libVLC 的 <c>libvlc_audio_channel_t</c>）。失败返回 -1。
+        /// </summary>
+        public int GetAudioChannel()
+        {
+            if (!IsAvailable || _player == IntPtr.Zero) return -1;
+            try { return LibVlcNative.libvlc_audio_get_channel(_player); }
+            catch (Exception ex)
+            {
+                _logger.Warn("VLC 读取声道模式失败: " + ex.Message);
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// 设置声道模式：只放左声道 / 只放右声道 / 立体声。
+        /// <para>
+        /// 这是**老式单音轨卡拉OK**唯一的原唱/伴奏切换手段：
+        /// 那类文件整首只有一条音轨，原唱和伴奏分别压在左右声道里
+        /// （docs §7.5），<see cref="SetAudioTrack"/> 对它完全无效 ——
+        /// 因为压根没有第二条音轨可切。
+        /// </para>
+        /// <para>
+        /// 取值见 <see cref="KtvDownloader.Services.VocalChannelRule"/>：1=立体声、3=只左、4=只右。
+        /// </para>
+        /// </summary>
+        public bool SetAudioChannel(int channel)
+        {
+            if (!IsAvailable || _player == IntPtr.Zero) return false;
+
+            try
+            {
+                var result = LibVlcNative.libvlc_audio_set_channel(_player, channel);
+                if (result == 0)
+                {
+                    _logger.Info("VLC 切换声道: " + channel);
+                    return true;
+                }
+
+                _logger.Warn("VLC 切换声道失败，返回 " + result);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("VLC 切换声道异常: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 视频的真实像素尺寸。取不到时返回 false。
+        /// <para>
+        /// 叠加层要靠它对齐画面：libVLC 默认等比缩放并居中，四周会有黑边，
+        /// 不知道视频尺寸就算不出画面真正落在 panelVideo 的哪一块，
+        /// 叠加层会画到黑边上、或者整体偏移。
+        /// </para>
+        /// <para>
+        /// ⚠️ 和音轨探测是同一类问题：libVLC 解 TS 是异步的，
+        /// 刚开始播放时这里经常返回失败。调用方要能容忍"暂时拿不到"，
+        /// 下一跳再问一次，不要拿到 false 就永久放弃。
+        /// </para>
+        /// </summary>
+        public bool TryGetVideoSize(out int width, out int height)
+        {
+            width = 0;
+            height = 0;
+
+            if (!IsAvailable || _player == IntPtr.Zero) return false;
+
+            try
+            {
+                uint w, h;
+                // 第一个参数是视频输出序号，绝大多数情况只有 0。
+                if (LibVlcNative.libvlc_video_get_size(_player, 0, out w, out h) != 0) return false;
+
+                if (w == 0 || h == 0) return false;
+
+                width = (int)w;
+                height = (int)h;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("VLC 读取视频尺寸失败: " + ex.Message);
+                return false;
+            }
+        }
+
         /// <summary>媒体总时长（毫秒）。未加载或未知时返回 0。</summary>
         public long GetLength()
         {
@@ -537,6 +625,19 @@ namespace KtvDownloader.Infrastructure.Media
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void libvlc_track_description_list_release(IntPtr description);
+
+        /// <summary>当前声道模式（libvlc_audio_channel_t）。</summary>
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int libvlc_audio_get_channel(IntPtr player);
+
+        /// <summary>设置声道模式；0 成功，负数失败。</summary>
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int libvlc_audio_set_channel(IntPtr player, int channel);
+
+        /// <summary>取视频像素尺寸；0 成功，-1 失败（还没解出视频流时会失败）。</summary>
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int libvlc_video_get_size(
+            IntPtr player, uint num, out uint width, out uint height);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern long libvlc_media_player_get_length(IntPtr player);

@@ -106,11 +106,9 @@ namespace KtvDownloader.Services
         public static string BuildPanFilter(int accomp, bool wantOriginal)
         {
             // accomp==2 → 原唱在右声道(c1)；否则原唱在左声道(c0)。
-            var originalIsRight = accomp == 2;
-
-            var sourceChannel = wantOriginal
-                ? (originalIsRight ? "c1" : "c0")
-                : (originalIsRight ? "c0" : "c1");
+            // 规则本身在 VocalChannelRule 里，预览播放（libVLC 切声道）也用它，
+            // 两边共用一份，不会出现"预览里是原唱、下载下来变伴奏"。
+            var sourceChannel = VocalChannelRule.ResolveSourceChannel(accomp, wantOriginal);
 
             return "pan=stereo|c0=" + sourceChannel + "|c1=" + sourceChannel;
         }
@@ -201,6 +199,243 @@ namespace KtvDownloader.Services
                    + " -c:v copy -c:a aac -b:a "
                    + ClampBitrate(audioBitrateKbps).ToString(CultureInfo.InvariantCulture)
                    + "k -movflags +faststart " + Quote(output);
+        }
+
+        /// <summary>视频质量因子下限。</summary>
+        public const int MinVideoCrf = 0;
+
+        /// <summary>视频质量因子上限（再大就是纯粹的垃圾画质了）。</summary>
+        public const int MaxVideoCrf = 51;
+
+        /// <summary>把质量因子夹到合法区间。</summary>
+        public static int ClampVideoCrf(int crf)
+        {
+            return Math.Max(MinVideoCrf, Math.Min(MaxVideoCrf, crf));
+        }
+
+        /// <summary>
+        /// 视频编码器参数。
+        /// <para>
+        /// 软编（libx264）用 <c>-preset</c> + <c>-crf</c>；硬编各家吃的不一样，传错直接失败退出：
+        /// nvenc 认 <c>-cq</c>、qsv 认 <c>-global_quality</c>，两者都认 <c>-preset</c>。
+        /// 没列进来的编码器就只给 <c>-c:v</c>，用它自己的默认参数 —— 画质不可控，但至少能跑通。
+        /// </para>
+        /// </summary>
+        public static string BuildVideoEncoderOptions(string encoder, string preset, int crf)
+        {
+            var name = (encoder ?? string.Empty).Trim().ToLowerInvariant();
+
+            // "auto" 正常情况下到不了这里 —— MediaService.ResolveEncoder 会先把它
+            // 换成实测可用的具体编码器。但这是个 public 纯函数，别的调用方可能直接传，
+            // 拼出 -c:v auto 会让 ffmpeg 报"未知编码器"，所以在这里也兜一道。
+            if (name.Length == 0 || name == OverlayComposition.AutoEncoder) name = "libx264";
+
+            var quality = ClampVideoCrf(crf).ToString(CultureInfo.InvariantCulture);
+            var head = "-c:v " + name;
+
+            if (name.EndsWith("_nvenc", StringComparison.Ordinal))
+                return head + " -preset " + preset + " -cq " + quality;
+
+            if (name.EndsWith("_qsv", StringComparison.Ordinal))
+                return head + " -preset " + preset + " -global_quality " + quality;
+
+            if (FfmpegFilterText.IsHardwareEncoder(name))
+                return head;   // amf / videotoolbox / mf：不猜参数，用编码器默认值
+
+            return head + " -preset " + preset + " -crf " + quality;
+        }
+
+        /// <summary>
+        /// 烧录叠加层（水印图片 / 文字卡片）的转码参数。
+        /// <para>
+        /// 与 <see cref="BuildConvertToMp4Arguments"/> 的<b>根本区别</b>：那边视频是
+        /// <c>-c:v copy</c>（流拷贝，几秒完事），这边任何叠加都要求把视频<b>解码→绘制→重编码</b>，
+        /// 一首歌从几秒变成一两分钟甚至更久。H.264 的帧间预测决定了没有捷径 ——
+        /// 哪怕水印只出现 5 秒，也必须整首重编码。
+        /// </para>
+        /// <para>
+        /// 所有叠加元素必须合并进<b>同一次</b>调用（见 <see cref="OverlayFilterBuilder"/>）：
+        /// 分几趟做等于重编码几遍，时间按倍数涨，画质还多损失几代。
+        /// </para>
+        /// <para>
+        /// 加了 <c>-progress pipe:1</c>：重编码耗时长，没有进度上报的话队列项会长时间
+        /// 停在"正在转码"不动，看着像卡死。ffmpeg 会往 stdout 吐 <c>out_time_ms=</c>
+        /// （<b>单位其实是微秒</b>，这是 ffmpeg 的老命名坑）和 <c>progress=continue|end</c>。
+        /// </para>
+        /// </summary>
+        /// <param name="plan">渲染计划，含滤镜图、图片输入顺序、待写文本文件。</param>
+        /// <param name="sampleSeconds">
+        /// &gt;0 时只烧前 N 秒（「试烧样片」用，几秒就能验证效果）。
+        /// 0 表示完整烧录。
+        /// </param>
+        /// <param name="copyAudio">
+        /// 音频是否直接流拷贝。<b>仅当源的音频已经是 AAC 时才可以传 true</b>：
+        /// 源是 TS 时音轨是 mp2，copy 进 MP4 会被标成 mp3，
+        /// 多数播放器解不出来，表现为"画面正常但完全没声音"（docs 坑1）。
+        /// </param>
+        public static string BuildBurnInArguments(
+            string source,
+            string output,
+            OverlayRenderPlan plan,
+            VocalOption vocal,
+            int audioTrackCount,
+            int audioBitrateKbps,
+            string videoEncoder,
+            string videoPreset,
+            int videoCrf,
+            int sampleSeconds,
+            bool copyAudio)
+        {
+            if (plan == null || plan.IsEmpty || string.IsNullOrEmpty(plan.FilterComplex))
+                throw new ArgumentException("渲染计划为空，不应走烧录路径", nameof(plan));
+
+            var builder = new StringBuilder();
+            builder.Append("-y -hide_banner");
+
+            // 试烧样片：-t 放在 -i **之前**才是输入选项（限制读取时长），
+            // 放在后面会变成输出选项 —— 那样 ffmpeg 会把整首解码完再截断，慢得多。
+            if (sampleSeconds > 0)
+            {
+                builder.Append(" -t ")
+                       .Append(sampleSeconds.ToString(CultureInfo.InvariantCulture));
+            }
+
+            builder.Append(" -i ").Append(Quote(source));
+
+            // 图片输入按渲染计划里的顺序追加，滤镜图用 [1:v]、[2:v]… 引用它们。
+            // ⚠️ 不需要 -loop 1：图片输入只有一帧，overlay 默认 repeatlast=1 会把它
+            //    一直保持到主视频结束，这正是我们要的。加了 -loop 1 反而变成无限输入，
+            //    还得配 -shortest，凭空多一个失败点。
+            foreach (var image in plan.ImageInputs)
+            {
+                builder.Append(" -i ").Append(Quote(image));
+            }
+
+            builder.Append(" -filter_complex ").Append(Quote(plan.FilterComplex));
+
+            // 视频走滤镜图的输出标签，不能再写 0:v（那条流已经被滤镜消费掉了）。
+            builder.Append(" -map ").Append(Quote("[" + plan.OutputLabel + "]"));
+
+            if (audioTrackCount >= 2)
+            {
+                switch (vocal)
+                {
+                    case VocalOption.OriginalOnly:
+                        builder.Append(" -map 0:a:0");
+                        break;
+                    case VocalOption.AccompanimentOnly:
+                        builder.Append(" -map 0:a:1");
+                        break;
+                    default:
+                        builder.Append(" -map 0:a:0 -map 0:a:1");
+                        break;
+                }
+            }
+            else if (audioTrackCount == 1)
+            {
+                builder.Append(" -map 0:a:0");
+            }
+
+            builder.Append(' ').Append(BuildVideoEncoderOptions(videoEncoder, videoPreset, videoCrf));
+            builder.Append(" -pix_fmt yuv420p");
+
+            if (audioTrackCount <= 0)
+            {
+                builder.Append(" -an");
+            }
+            else if (copyAudio)
+            {
+                builder.Append(" -c:a copy");
+            }
+            else
+            {
+                builder.Append(" -c:a aac -b:a ")
+                       .Append(ClampBitrate(audioBitrateKbps).ToString(CultureInfo.InvariantCulture))
+                       .Append("k -ac 2");
+            }
+
+            builder.Append(" -movflags +faststart");
+            builder.Append(" -progress pipe:1");
+            builder.Append(' ').Append(Quote(output));
+
+            return builder.ToString();
+        }
+
+        /// <summary>
+        /// 把<b>已经烧好叠加层的视频流</b>和另一个文件的音轨合到一起，两边都流拷贝。
+        /// <para>
+        /// <b>为什么需要它：</b><c>VocalOption.SplitBoth</c> 会产出原唱版和伴奏版两个 MP4，
+        /// 而它们的视频画面是<b>完全相同</b>的 ——
+        /// <see cref="BuildExtractTrackArguments"/> 与 <see cref="BuildExtractChannelArguments"/>
+        /// 都用 <c>-c:v copy</c>，两个文件的视频流是从同一个 TS 拷出来的同一份数据。
+        /// 于是给两个文件各烧一遍叠加层，等于把<b>同一段视频重编码两次</b>：
+        /// 一首 4 分钟 720p 的歌从 1–3 分钟变成 2–6 分钟，画质还多损失一代。
+        /// </para>
+        /// <para>
+        /// 正确做法是只烧第一个，剩下的用这个函数把烧好的视频流直接拷过来、
+        /// 配上各自的音轨。视频不重编码 ⇒ 秒级完成，而且两个成品的画面<b>逐比特相同</b>，
+        /// 不会出现"原唱版的水印比伴奏版糊一点"这种没法解释的差别。
+        /// </para>
+        /// <para>
+        /// ⚠️ 前提是两边的视频流确实同源。<c>DownloadService.ApplyBurnInAsync</c>
+        /// 只在同一次 <c>SplitVocal</c> 产出的文件之间这么做，不要拿去合并任意两个视频。
+        /// </para>
+        /// </summary>
+        /// <param name="burnedVideoSource">已经烧好叠加层的文件，只取它的视频流（<c>0:v:0</c>）。</param>
+        /// <param name="audioSource">提供音轨的文件，只取它的第一条音轨（<c>1:a:0</c>）。</param>
+        /// <param name="audioTrackCount">
+        /// <paramref name="audioSource"/> 的音轨数。为 0 时输出 <c>-an</c> ——
+        /// 映射不存在的 <c>1:a:0</c> 会让整条命令失败。
+        /// </param>
+        /// <param name="copyAudio">
+        /// 音轨已经是 AAC 时为 true，直接 <c>-c:a copy</c>（SplitVocal 产出的就是 AAC）。
+        /// false 则重编码 —— 不是 AAC 的编码拷进 MP4 会踩 docs 坑1（静音播放）。
+        /// </param>
+        public static string BuildVideoReuseArguments(
+            string burnedVideoSource,
+            string audioSource,
+            string output,
+            int audioTrackCount,
+            bool copyAudio,
+            int audioBitrateKbps)
+        {
+            if (string.IsNullOrWhiteSpace(burnedVideoSource))
+                throw new ArgumentException("烧好视频流的源文件为空", nameof(burnedVideoSource));
+            if (string.IsNullOrWhiteSpace(audioSource))
+                throw new ArgumentException("提供音轨的源文件为空", nameof(audioSource));
+
+            var builder = new StringBuilder();
+            builder.Append("-y -hide_banner");
+            builder.Append(" -i ").Append(Quote(burnedVideoSource));
+            builder.Append(" -i ").Append(Quote(audioSource));
+
+            // 视频只从第一个输入取，音频只从第二个输入取。
+            // 不写 -map 的话 ffmpeg 的默认流选择会各挑一条"最好的"，
+            // 很可能把烧好视频的那个文件的音轨也带进来，变成两条音轨。
+            builder.Append(" -map 0:v:0");
+            if (audioTrackCount > 0) builder.Append(" -map 1:a:0");
+
+            builder.Append(" -c:v copy");
+
+            if (audioTrackCount <= 0)
+            {
+                builder.Append(" -an");
+            }
+            else if (copyAudio)
+            {
+                builder.Append(" -c:a copy");
+            }
+            else
+            {
+                builder.Append(" -c:a aac -b:a ")
+                       .Append(ClampBitrate(audioBitrateKbps).ToString(CultureInfo.InvariantCulture))
+                       .Append("k -ac 2");
+            }
+
+            builder.Append(" -movflags +faststart");
+            builder.Append(' ').Append(Quote(output));
+
+            return builder.ToString();
         }
 
         /// <summary>
