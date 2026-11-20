@@ -106,11 +106,9 @@ namespace KtvDownloader.Services
         public static string BuildPanFilter(int accomp, bool wantOriginal)
         {
             // accomp==2 → 原唱在右声道(c1)；否则原唱在左声道(c0)。
-            var originalIsRight = accomp == 2;
-
-            var sourceChannel = wantOriginal
-                ? (originalIsRight ? "c1" : "c0")
-                : (originalIsRight ? "c0" : "c1");
+            // 规则本身在 VocalChannelRule 里，预览播放（libVLC 切声道）也用它，
+            // 两边共用一份，不会出现"预览里是原唱、下载下来变伴奏"。
+            var sourceChannel = VocalChannelRule.ResolveSourceChannel(accomp, wantOriginal);
 
             return "pan=stereo|c0=" + sourceChannel + "|c1=" + sourceChannel;
         }

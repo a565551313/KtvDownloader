@@ -61,6 +61,35 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
         private const string OrderClause =
             " ORDER BY s.hot_score DESC, s.name ASC";
 
+        /// <summary>
+        /// 「这首歌属于某个歌手」的匹配条件，绑定参数名固定为 <c>@singerLike</c>（值形如 <c>%周杰伦%</c>）。
+        /// <para>
+        /// A 路径走关联表（正经挂了歌手名的原唱版）；B 路径扫歌名，
+        /// 覆盖曲库把 Cover 版歌手标成「佚名」、真名只写在
+        /// 「发如雪（Cover：周杰伦）」这种歌名里的情况（docs §10.1 第一条已知限制）。
+        /// </para>
+        /// <para>
+        /// ⚠️ B 不是锦上添花，对一线歌手它是**主要来源**：周杰伦、林俊杰这些没有原唱授权的歌手，
+        /// 曲库里几百首歌的歌手字段一律是「佚名」，只查 A 的话搜「周杰伦」只能捞到 2 首。
+        /// </para>
+        /// <para>
+        /// 代价：B 是 <c>LIKE '%x%'</c> 全表扫（docs 坑9，约 400ms）。
+        /// 但它和中文歌名搜索走的是同一条扫描路径，量级一致，这个代价值得付。
+        /// </para>
+        /// <para>
+        /// 按歌手搜索、组合搜索、以及它们各自的计数查询**必须共用这一段**，
+        /// 否则「共 N 条」和实际列出来的条数会对不上。
+        /// </para>
+        /// </summary>
+        private const string SingerMatchClause = @" AND (
+    EXISTS (SELECT 1 FROM song_singer_relations r
+             JOIN singers sg ON sg.id = r.singer_id
+            WHERE r.song_id = s.id
+              AND (sg.name LIKE @singerLike OR sg.name_trim LIKE @singerLike))
+    OR s.name LIKE @singerLike
+    OR s.name_trim LIKE @singerLike
+)";
+
         public SongSearchService(ILogger logger, string databasePath)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -203,15 +232,9 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
                 var builder = new StringBuilder(SongSelect);
                 var parameters = new List<SQLiteParameter>();
 
-                builder.Append(@" AND s.id IN (
-SELECT r.song_id
-  FROM song_singer_relations r
-  JOIN singers sg ON sg.id = r.singer_id
- WHERE sg.name LIKE @singer OR sg.name_trim LIKE @singerTrim)");
+                builder.Append(SingerMatchClause);
 
-                var pattern = "%" + trimmed + "%";
-                parameters.Add(new SQLiteParameter("@singer", pattern));
-                parameters.Add(new SQLiteParameter("@singerTrim", pattern));
+                parameters.Add(new SQLiteParameter("@singerLike", "%" + trimmed + "%"));
 
                 builder.Append(OrderClause);
                 builder.Append(" LIMIT @limit OFFSET @offset");
@@ -493,16 +516,9 @@ SELECT id, name, name_cap, name_full, name_trim, image, type, area, hot_score
                     // 歌手条件
                     if (singer.Length > 0)
                     {
-                        // 两种命中方式：
-                        // A. 关联表里确实有这个歌手
-                        // B. 歌名里包含歌手名（覆盖「发如雪（Cover：周杰伦）」）
-                        builder.Append(@" AND (
-    EXISTS (SELECT 1 FROM song_singer_relations r
-             JOIN singers sg ON sg.id = r.singer_id
-            WHERE r.song_id = s.id
-              AND (sg.name LIKE @singerLike OR sg.name_trim LIKE @singerLike))
-    OR s.name LIKE @singerLike
-)");
+                        // 两种命中方式（关联表 / 歌名里的「Cover：xxx」），
+                        // 与「按歌手搜索」共用同一段条件。
+                        builder.Append(SingerMatchClause);
                         parameters.Add(new SQLiteParameter("@singerLike", "%" + singer + "%"));
                     }
 
@@ -579,12 +595,8 @@ SELECT COUNT(*) FROM songs s
 
                     if (singer.Length > 0)
                     {
-                        builder.Append(@" AND (
-    EXISTS (SELECT 1 FROM song_singer_relations r
-             JOIN singers sg ON sg.id = r.singer_id
-            WHERE r.song_id = s.id
-              AND (sg.name LIKE @singerLike OR sg.name_trim LIKE @singerLike))
-    OR s.name LIKE @singerLike)");
+                        // 与 SearchCombinedAsync 共用同一段条件，计数才会和列表对得上。
+                        builder.Append(SingerMatchClause);
                         parameters.Add(new SQLiteParameter("@singerLike", "%" + singer + "%"));
                     }
 
@@ -771,13 +783,10 @@ SELECT tags FROM tag_groups
                     {
                         builder.Append(@"
 SELECT COUNT(*) FROM songs s
- WHERE s.deleted_at IS NULL AND s.filename IS NOT NULL AND s.filename <> ''
-   AND s.id IN (SELECT r.song_id FROM song_singer_relations r
-                JOIN singers sg ON sg.id = r.singer_id
-                WHERE sg.name LIKE @kw OR sg.name_trim LIKE @kwTrim)");
-                        var pattern = "%" + trimmed + "%";
-                        parameters.Add(new SQLiteParameter("@kw", pattern));
-                        parameters.Add(new SQLiteParameter("@kwTrim", pattern));
+ WHERE s.deleted_at IS NULL AND s.filename IS NOT NULL AND s.filename <> ''");
+                        // 与 SearchBySingerCore 共用同一段条件（含 Cover 版的歌名匹配）。
+                        builder.Append(SingerMatchClause);
+                        parameters.Add(new SQLiteParameter("@singerLike", "%" + trimmed + "%"));
                     }
                     else
                     {

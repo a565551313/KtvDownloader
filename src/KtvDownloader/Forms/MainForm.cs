@@ -669,9 +669,12 @@ namespace KtvDownloader.Forms
                 paginationBar.SetPagination(1, pageSize,
                     firstPage.Count < pageSize ? firstPage.Count : pageSize * 10);
                 lblResultSummary.Text = _lastIsCombined
-                    ? string.Format("「{0}」+「{1}」　正在统计...",
-                        _lastQuery.SongName, _lastQuery.SingerName)
-                    : string.Format("搜索「{0}」　正在统计...", _lastKeyword);
+                    ? BuildResultSummary(
+                        string.Format("「{0}」+「{1}」", _lastQuery.SongName, _lastQuery.SingerName),
+                        "正在统计...", _lastQuery.SingerName, firstPage)
+                    : BuildResultSummary(
+                        string.Format("搜索「{0}」", _lastKeyword), "正在统计...",
+                        _lastSearchBySinger ? _lastKeyword : null, firstPage);
                 UpdateStatus(string.Format("已显示 {0} 条，后台统计中", firstPage.Count));
 
                 SetSearchBusy(false);
@@ -694,6 +697,52 @@ namespace KtvDownloader.Forms
             {
                 if (!IsDisposed) SetSearchBusy(false);
             }
+        }
+
+        /// <summary>
+        /// 生成搜索结果汇总文案。
+        /// <para>
+        /// 第三个参数非空时会按**已加载的结果**判断要不要补一句说明：
+        /// 如果有些歌是靠歌名匹配进来的、歌手字段里却没有这个词，
+        /// 说明命中的是「发如雪（Cover：周杰伦）」这类翻唱版 ——
+        /// 曲库把歌手标成了「佚名」，真名只写在歌名里。
+        /// 不解释的话，用户看着满屏「佚名」会以为搜错了。
+        /// </para>
+        /// </summary>
+        /// <param name="title">标题部分，例如「搜索「周杰伦」」。</param>
+        /// <param name="totalText">条数文案，例如「共 372 条」。</param>
+        /// <param name="singerKeyword">按歌手搜索时的关键词；按歌名搜索传 null（不补说明）。</param>
+        /// <param name="loaded">已加载到界面上的结果。</param>
+        private static string BuildResultSummary(
+            string title, string totalText, string singerKeyword, IReadOnlyList<Song> loaded)
+        {
+            var text = title + "　" + totalText;
+            return HasNameOnlyHits(singerKeyword, loaded)
+                ? text + "　（含歌名里的「Cover：」版本，歌手列可能显示「佚名」）"
+                : text;
+        }
+
+        /// <summary>
+        /// 是否存在「歌名里有这个词、但歌手字段里没有」的结果。
+        /// </summary>
+        private static bool HasNameOnlyHits(string keyword, IReadOnlyList<Song> songs)
+        {
+            if (string.IsNullOrEmpty(keyword) || songs == null) return false;
+
+            foreach (var song in songs)
+            {
+                if (song == null) continue;
+
+                var inName = (song.Name ?? string.Empty)
+                    .IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!inName) continue;
+
+                var inSinger = (song.Singer ?? string.Empty)
+                    .IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!inSinger) return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -736,8 +785,15 @@ namespace KtvDownloader.Forms
                     {
                         if (IsDisposed) return;
                         paginationBar.SetPagination(1, paginationBar.PageSize, total);
-                        lblResultSummary.Text = string.Format("搜索「{0}」　共 {1} 条",
-                            keyword, total);
+                        // bySinger / isCombined / singerName 都是进后台前快照的局部变量，
+                        // 不能改读字段：后台可能跑几十秒，期间用户已经搜了别的。
+                        lblResultSummary.Text = BuildResultSummary(
+                            string.Format("搜索「{0}」", keyword),
+                            string.Format("共 {0} 条", total),
+                            (isCombined || bySinger)
+                                ? (isCombined ? singerName : keyword)
+                                : null,
+                            _searchResults);
                     }));
 
                     // 预加载全部
@@ -908,8 +964,13 @@ namespace KtvDownloader.Forms
                 AppendSearchResults(pageSongs, true);
 
                 paginationBar.SetPagination(page, pageSize, _prefetchCache.Count);
-                lblResultSummary.Text = string.Format("搜索「{0}」　第 {1} 页，共 {2} 条",
-                    _lastKeyword, page, _prefetchCache.Count);
+                lblResultSummary.Text = BuildResultSummary(
+                    string.Format("搜索「{0}」", _lastKeyword),
+                    string.Format("第 {0} 页，共 {1} 条", page, _prefetchCache.Count),
+                    (_lastSearchBySinger || _lastIsCombined)
+                        ? (_lastIsCombined && _lastQuery != null ? _lastQuery.SingerName : _lastKeyword)
+                        : null,
+                    pageSongs);
                 UpdateStatus(string.Format("第 {0} 页（来自缓存）", page));
             }
             catch (Exception ex)
