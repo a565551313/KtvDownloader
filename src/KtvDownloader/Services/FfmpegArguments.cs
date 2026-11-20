@@ -358,6 +358,83 @@ namespace KtvDownloader.Services
         }
 
         /// <summary>
+        /// 把<b>已经烧好叠加层的视频流</b>和另一个文件的音轨合到一起，两边都流拷贝。
+        /// <para>
+        /// <b>为什么需要它：</b><c>VocalOption.SplitBoth</c> 会产出原唱版和伴奏版两个 MP4，
+        /// 而它们的视频画面是<b>完全相同</b>的 ——
+        /// <see cref="BuildExtractTrackArguments"/> 与 <see cref="BuildExtractChannelArguments"/>
+        /// 都用 <c>-c:v copy</c>，两个文件的视频流是从同一个 TS 拷出来的同一份数据。
+        /// 于是给两个文件各烧一遍叠加层，等于把<b>同一段视频重编码两次</b>：
+        /// 一首 4 分钟 720p 的歌从 1–3 分钟变成 2–6 分钟，画质还多损失一代。
+        /// </para>
+        /// <para>
+        /// 正确做法是只烧第一个，剩下的用这个函数把烧好的视频流直接拷过来、
+        /// 配上各自的音轨。视频不重编码 ⇒ 秒级完成，而且两个成品的画面<b>逐比特相同</b>，
+        /// 不会出现"原唱版的水印比伴奏版糊一点"这种没法解释的差别。
+        /// </para>
+        /// <para>
+        /// ⚠️ 前提是两边的视频流确实同源。<c>DownloadService.ApplyBurnInAsync</c>
+        /// 只在同一次 <c>SplitVocal</c> 产出的文件之间这么做，不要拿去合并任意两个视频。
+        /// </para>
+        /// </summary>
+        /// <param name="burnedVideoSource">已经烧好叠加层的文件，只取它的视频流（<c>0:v:0</c>）。</param>
+        /// <param name="audioSource">提供音轨的文件，只取它的第一条音轨（<c>1:a:0</c>）。</param>
+        /// <param name="audioTrackCount">
+        /// <paramref name="audioSource"/> 的音轨数。为 0 时输出 <c>-an</c> ——
+        /// 映射不存在的 <c>1:a:0</c> 会让整条命令失败。
+        /// </param>
+        /// <param name="copyAudio">
+        /// 音轨已经是 AAC 时为 true，直接 <c>-c:a copy</c>（SplitVocal 产出的就是 AAC）。
+        /// false 则重编码 —— 不是 AAC 的编码拷进 MP4 会踩 docs 坑1（静音播放）。
+        /// </param>
+        public static string BuildVideoReuseArguments(
+            string burnedVideoSource,
+            string audioSource,
+            string output,
+            int audioTrackCount,
+            bool copyAudio,
+            int audioBitrateKbps)
+        {
+            if (string.IsNullOrWhiteSpace(burnedVideoSource))
+                throw new ArgumentException("烧好视频流的源文件为空", nameof(burnedVideoSource));
+            if (string.IsNullOrWhiteSpace(audioSource))
+                throw new ArgumentException("提供音轨的源文件为空", nameof(audioSource));
+
+            var builder = new StringBuilder();
+            builder.Append("-y -hide_banner");
+            builder.Append(" -i ").Append(Quote(burnedVideoSource));
+            builder.Append(" -i ").Append(Quote(audioSource));
+
+            // 视频只从第一个输入取，音频只从第二个输入取。
+            // 不写 -map 的话 ffmpeg 的默认流选择会各挑一条"最好的"，
+            // 很可能把烧好视频的那个文件的音轨也带进来，变成两条音轨。
+            builder.Append(" -map 0:v:0");
+            if (audioTrackCount > 0) builder.Append(" -map 1:a:0");
+
+            builder.Append(" -c:v copy");
+
+            if (audioTrackCount <= 0)
+            {
+                builder.Append(" -an");
+            }
+            else if (copyAudio)
+            {
+                builder.Append(" -c:a copy");
+            }
+            else
+            {
+                builder.Append(" -c:a aac -b:a ")
+                       .Append(ClampBitrate(audioBitrateKbps).ToString(CultureInfo.InvariantCulture))
+                       .Append("k -ac 2");
+            }
+
+            builder.Append(" -movflags +faststart");
+            builder.Append(' ').Append(Quote(output));
+
+            return builder.ToString();
+        }
+
+        /// <summary>
         /// 预览转码参数：裁前 N 秒、视频流拷贝、音频转 AAC、fMP4 分片（可边下边播）。
         /// </summary>
         /// <param name="durationSeconds">0 表示不裁剪（完整转码）。</param>

@@ -425,6 +425,12 @@ namespace KtvDownloader.Services
                 return;
             }
 
+            // SplitBoth 会产出原唱版和伴奏版两个文件，而它们的**视频画面完全相同**
+            // （SplitVocal 的两个抽取路径都是 -c:v copy）。各烧一遍等于把同一段视频
+            // 重编码两次：一首 4 分钟的歌从 1–3 分钟变成 2–6 分钟，画质还多损失一代。
+            // 所以只烧第一个，剩下的把烧好的视频流直接拷过来配上各自的音轨（秒级）。
+            string burnedDonor = null;
+
             for (var i = 0; i < paths.Length; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -444,6 +450,40 @@ namespace KtvDownloader.Services
                 // 先写到临时文件再换过去：直接写目标文件的话，中途失败会留下一个
                 // 半截的 MP4，把第一步产出的好文件也毁了。
                 var tempPath = path + ".burn.mp4";
+
+                // ── 快路径：已经有一个烧好的同源视频，拷过来就行，不重编码 ──
+                if (burnedDonor != null)
+                {
+                    try
+                    {
+                        var reused = await _mediaService.ReuseBurnedVideoAsync(
+                            burnedDonor, path, tempPath, cancellationToken).ConfigureAwait(false);
+
+                        if (reused)
+                        {
+                            MoveOver(tempPath, path);
+                            _logger.Info("叠加层已复用烧好的视频流: " + path);
+                            progress?.Report(new DownloadProgress(
+                                DownloadState.Converting, 100, null,
+                                string.Format("叠加层已应用 {0}/{1}（复用视频流，未重编码）",
+                                    index + 1, paths.Length)));
+                            continue;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        TryDelete(tempPath);
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Warn("复用视频流失败，改为重新烧录: " + ex.Message);
+                        TryDelete(tempPath);
+                    }
+
+                    // 复用没成（探测不出来、ffmpeg 报错、文件被占）就掉下去走正常烧录。
+                    // 慢一倍总比拿不到成品好。
+                }
 
                 try
                 {
@@ -486,6 +526,9 @@ namespace KtvDownloader.Services
                     // 这里只负责把烧好的文件换到位。
                     MoveOver(tempPath, path);
                     _logger.Info("叠加层已烧录: " + path);
+
+                    // 这个文件现在带着烧好的视频流，后面同源的几个可以复用它。
+                    if (burnedDonor == null) burnedDonor = path;
 
                     if (warningHint.Length > 0)
                     {

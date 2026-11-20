@@ -281,6 +281,99 @@ namespace KtvDownloader.Tests
                 "libx264", "veryfast", 20, 0, false);
         }
 
+        // ── SplitBoth 的视频流复用 ──────────────────────────────────────
+        //
+        // 原唱版和伴奏版的画面完全相同（SplitVocal 两个抽取路径都是 -c:v copy），
+        // 各烧一遍等于把同一段视频重编码两次：一首 4 分钟的歌从 1–3 分钟变成
+        // 2–6 分钟，画质还多损失一代。所以只烧第一个，剩下的拷视频流 + 配各自音轨。
+
+        [TestMethod]
+        public void 复用_视频取第一个输入音频取第二个且两边都流拷贝()
+        {
+            var args = FfmpegArguments.BuildVideoReuseArguments(
+                "burned-原唱.mp4", "伴奏.mp4", "out.mp4", 1, true, 192);
+
+            // 视频不重编码 —— 这正是省时间的全部来源。
+            Assert.IsTrue(args.Contains("-c:v copy"), args);
+            Assert.IsFalse(args.Contains("-c:v libx264"), "不该重编码视频：" + args);
+
+            // ⚠️ 不写 -map 的话 ffmpeg 的默认流选择会各挑一条"最好的"，
+            // 很可能把烧好视频那个文件的音轨也带进来，成品就变成两条音轨。
+            Assert.IsTrue(args.Contains("-map 0:v:0"), args);
+            Assert.IsTrue(args.Contains("-map 1:a:0"), args);
+
+            // 音轨来自第二个输入，不是第一个（第一个的音轨是原唱，不能带到伴奏版里）。
+            var videoInput = args.IndexOf("\"burned-原唱.mp4\"", StringComparison.Ordinal);
+            var audioInput = args.IndexOf("\"伴奏.mp4\"", StringComparison.Ordinal);
+            Assert.IsTrue(videoInput >= 0 && audioInput > videoInput,
+                "输入顺序错了：0 号必须是烧好视频的那个：" + args);
+        }
+
+        [TestMethod]
+        public void 复用_音轨已是AAC时直接拷贝()
+        {
+            var args = FfmpegArguments.BuildVideoReuseArguments(
+                "v.mp4", "a.mp4", "o.mp4", 1, true, 192);
+
+            Assert.IsTrue(args.Contains("-c:a copy"), args);
+            Assert.IsFalse(args.Contains("-c:a aac"), args);
+        }
+
+        [TestMethod]
+        public void 复用_音轨不是AAC时必须重编码()
+        {
+            // 不是 AAC 的编码拷进 MP4 会踩 docs 坑1：容器标签和实际数据不符，
+            // 表现为"画面正常但完全没声音"。
+            var args = FfmpegArguments.BuildVideoReuseArguments(
+                "v.mp4", "a.ts", "o.mp4", 1, false, 192);
+
+            Assert.IsTrue(args.Contains("-c:a aac -b:a 192k -ac 2"), args);
+            Assert.IsFalse(args.Contains("-c:a copy"), args);
+        }
+
+        [TestMethod]
+        public void 复用_没有音轨时不映射音频()
+        {
+            var args = FfmpegArguments.BuildVideoReuseArguments(
+                "v.mp4", "silent.mp4", "o.mp4", 0, true, 192);
+
+            Assert.IsTrue(args.Contains(" -an"), args);
+            Assert.IsFalse(args.Contains("1:a:"), "映射不存在的音轨会让整条命令失败：" + args);
+
+            // 视频照样要拷过来。
+            Assert.IsTrue(args.Contains("-map 0:v:0"), args);
+            Assert.IsTrue(args.Contains("-c:v copy"), args);
+        }
+
+        [TestMethod]
+        public void 复用_输出带faststart()
+        {
+            var args = FfmpegArguments.BuildVideoReuseArguments(
+                "v.mp4", "a.mp4", "o.mp4", 1, true, 192);
+
+            Assert.IsTrue(args.Contains("-movflags +faststart"), args);
+            Assert.IsTrue(args.EndsWith("\"o.mp4\""), "输出必须是最后一个参数：" + args);
+        }
+
+        [TestMethod]
+        public void 复用_空的源路径直接抛异常()
+        {
+            // 拼出一条 -i "" 的命令，ffmpeg 的报错和真正的原因隔好几层。
+            try
+            {
+                FfmpegArguments.BuildVideoReuseArguments(null, "a.mp4", "o.mp4", 1, true, 192);
+                Assert.Fail("视频源为空时应该抛 ArgumentException");
+            }
+            catch (ArgumentException) { }
+
+            try
+            {
+                FfmpegArguments.BuildVideoReuseArguments("v.mp4", "  ", "o.mp4", 1, true, 192);
+                Assert.Fail("音轨源为空时应该抛 ArgumentException");
+            }
+            catch (ArgumentException) { }
+        }
+
         #endregion
 
         #region 进度解析

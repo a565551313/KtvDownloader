@@ -88,6 +88,30 @@ namespace KtvDownloader.Services.Interfaces
             int audioBitrateKbps,
             int accomp,
             CancellationToken cancellationToken = default(CancellationToken));
+
+        /// <summary>
+        /// 把<b>已经烧好叠加层的视频流</b>与另一个文件的音轨合到一起，两边都流拷贝。
+        /// <para>
+        /// 给 <c>VocalOption.SplitBoth</c> 用：原唱版和伴奏版的画面完全相同
+        /// （两个抽取路径都是 <c>-c:v copy</c>），各烧一遍等于把<b>同一段视频重编码两次</b>
+        /// —— 一首 4 分钟的歌从 1–3 分钟变成 2–6 分钟，画质还多损失一代。
+        /// 只烧第一个、剩下的用这个函数拷视频流，秒级完成，
+        /// 而且两个成品的画面逐比特相同，不会出现"原唱版的水印比伴奏版糊一点"。
+        /// </para>
+        /// <para>
+        /// ⚠️ 前提是两边视频流确实同源。调用方只在同一次 <c>SplitVocal</c>
+        /// 产出的文件之间这么做，不要拿去合并任意两个视频。
+        /// 参数细节见 <c>FfmpegArguments.BuildVideoReuseArguments</c>。
+        /// </para>
+        /// </summary>
+        /// <param name="burnedVideoSource">已烧好叠加层的文件，只取它的视频流。</param>
+        /// <param name="audioSource">提供音轨的文件，只取它的第一条音轨。</param>
+        /// <returns>成功产出 <paramref name="output"/> 返回 true。</returns>
+        Task<bool> ReuseBurnedVideoAsync(
+            string burnedVideoSource,
+            string audioSource,
+            string output,
+            CancellationToken cancellationToken = default(CancellationToken));
     }
 
     /// <summary>

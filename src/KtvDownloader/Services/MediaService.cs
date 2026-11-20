@@ -569,6 +569,87 @@ namespace KtvDownloader.Services
             }
         }
 
+        /// <inheritdoc/>
+        public Task<bool> ReuseBurnedVideoAsync(
+            string burnedVideoSource,
+            string audioSource,
+            string output,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return Task.Run(() => ReuseBurnedVideo(
+                burnedVideoSource, audioSource, output, cancellationToken), cancellationToken);
+        }
+
+        private bool ReuseBurnedVideo(
+            string burnedVideoSource,
+            string audioSource,
+            string output,
+            CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(burnedVideoSource) ||
+                string.IsNullOrWhiteSpace(audioSource) ||
+                string.IsNullOrWhiteSpace(output))
+            {
+                return false;
+            }
+
+            if (!File.Exists(burnedVideoSource) || !File.Exists(audioSource)) return false;
+            if (!IsFfmpegAvailable) return false;
+
+            try
+            {
+                // 探一下提供音轨的那个文件：音轨是不是 AAC 决定能不能 -c:a copy，
+                // 音轨数决定要不要 -an。探测结果带缓存，同一次批量下载里几乎不花钱。
+                //
+                // 这里刻意**保守**：探不出音轨数（Usable=false）就放弃复用、
+                // 让调用方回落到老老实实重编码一遍。省时间不值得拿"静音成品"去换。
+                var probe = Probe(audioSource, cancellationToken);
+                if (!probe.Usable)
+                {
+                    _logger.Warn("复用烧好视频流前探测失败，回落为重新烧录: " + audioSource);
+                    return false;
+                }
+
+                var arguments = FfmpegArguments.BuildVideoReuseArguments(
+                    burnedVideoSource, audioSource, output,
+                    probe.AudioTrackCount, probe.AudioIsAac, 192);
+
+                var run = Run(arguments, RunTimeout, cancellationToken);
+
+                if (run.TimedOut)
+                {
+                    _logger.Warn("复用视频流超时: " + output);
+                    return false;
+                }
+
+                if (run.ExitCode != 0)
+                {
+                    _logger.Warn("复用视频流失败（退出码 " + run.ExitCode + "）: " +
+                                 Tail(run.StdErr, 400));
+                    return false;
+                }
+
+                if (!File.Exists(output))
+                {
+                    _logger.Warn("ffmpeg 报告成功但输出不存在: " + output);
+                    return false;
+                }
+
+                InvalidateProbe(output);
+                _logger.Info("已复用烧好的视频流（未重编码）: " + output);
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("复用视频流异常，回落为重新烧录: " + ex.Message);
+                return false;
+            }
+        }
+
         /// <summary>
         /// 校验用户配置的编码器是否真的存在，不存在就回落 libx264。
         /// <para>
