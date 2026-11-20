@@ -31,18 +31,6 @@ namespace KtvDownloader.Infrastructure.Extensions
         /// <summary>判断字符串是否非空（去除首尾空白后仍有内容）。</summary>
         public static bool HasValue(this string value) => !string.IsNullOrWhiteSpace(value);
 
-        /// <summary>取字符串左侧指定长度，超出部分丢弃。</summary>
-        public static string Left(this string value, int length)
-        {
-            if (string.IsNullOrEmpty(value) || length <= 0) return string.Empty;
-            return value.Length <= length ? value : value.Substring(0, length);
-        }
-
-        /// <summary>把可空 long 安全地格式化为字节文本；null 返回「未知大小」。</summary>
-        public static string ToSizeText(this long? bytes)
-        {
-            return bytes.HasValue ? Models.DownloadProgress.FormatSize(bytes.Value) : "未知大小";
-        }
     }
 
     /// <summary>

@@ -12,10 +12,32 @@ packages/
 *.nupkg
 
 # 工具（体积大，不纳入版本控制）
+# ⚠️ 仓库里没有 tools/ffmpeg.exe，但 csproj 只在文件存在时才引用它
+#    （Condition="Exists(...)"），所以缺它也能编译；MediaService 会退回 PATH 查找。
 tools/ffmpeg.exe
+tools/
 
 # 本地数据
 *.db
 *.db-shm
 *.db-wal
 downloads/
+
+# 曲库更新留下的东西
+# muse.db.backup 是安装新曲库时旧库被改名保留的副本，约 983MB，
+# 程序不会自动删（确认新曲库可用后需要手动清理），绝不能进版本库。
+*.db.backup
+*.db.download
+*.gz.download
+db_version.txt
+
+# 预览缓存（PreviewService 自己管理容量上限，默认 512MB / 200 个文件）
+preview-cache/
+
+# 配置写入用的临时文件（ConfigStore 原子写入的中转文件）
+*.json.tmp
+
+# 测试结果
+TestResults/
+*.trx
+*.coverage

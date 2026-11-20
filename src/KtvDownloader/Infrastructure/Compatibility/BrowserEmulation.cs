@@ -7,6 +7,13 @@ namespace KtvDownloader.Infrastructure.Compatibility
     /// <summary>
     /// 让 WinForms 的 <see cref="System.Windows.Forms.WebBrowser"/> 以 IE11 模式运行。
     /// <para>
+    /// ⚠️ **当前没有任何调用者**，是刻意保留的。
+    /// 预览早已改用 libVLC（原生支持 MPEG-TS + mp2，不需要 HTML5 &lt;video&gt;），
+    /// 所以这条路径走不到了。留着是因为：将来若要内嵌任何网页
+    /// （歌词、公告、扫码登录…），net48 的 WebBrowser 默认跑在 IE7 兼容模式，
+    /// 忘了这一步就会得到一片黑屏，而且没有任何报错。
+    /// </para>
+    /// <para>
     /// net48 的 WebBrowser 默认跑在 IE7 兼容模式，不支持 HTML5 &lt;video&gt;，
     /// 预览播放会直接黑屏。必须在注册表里为当前 exe 声明浏览器模拟版本。
     /// </para>

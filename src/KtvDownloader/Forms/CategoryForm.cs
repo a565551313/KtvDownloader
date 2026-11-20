@@ -41,7 +41,11 @@ namespace KtvDownloader.Forms
             {
                 // 语种按钮
                 var languages = await _searchService.GetLanguagesAsync();
-                panelLanguages.Controls.Clear();
+
+                // await 回来时窗体可能已经被用户关掉了，再动控件就是 ObjectDisposedException。
+                if (IsDisposed || Disposing) return;
+
+                ClearLanguageButtons();
 
                 foreach (var language in languages)
                 {
@@ -77,6 +81,27 @@ namespace KtvDownloader.Forms
             {
                 _logger.Error("加载分类失败", ex);
                 lblLanguageHint.Text = "加载失败：" + ex.Message;
+            }
+        }
+
+        /// <summary>
+        /// 清掉上一轮生成的语种按钮，**并释放它们**。
+        /// <para>
+        /// ⚠️ <c>Controls.Clear()</c> 只是把控件从集合里摘出来，不会 Dispose。
+        /// 每个 Button 都有自己的窗口句柄，摘出来之后没人再引用它，
+        /// 句柄却要等到 GC 跑完终结器才释放 —— 反复打开分类窗体时
+        /// 句柄数只涨不降，最后撞上 Win32 的每进程句柄上限。
+        /// </para>
+        /// </summary>
+        private void ClearLanguageButtons()
+        {
+            var old = new Control[panelLanguages.Controls.Count];
+            panelLanguages.Controls.CopyTo(old, 0);
+            panelLanguages.Controls.Clear();
+
+            foreach (var control in old)
+            {
+                try { control.Dispose(); } catch { }
             }
         }
 

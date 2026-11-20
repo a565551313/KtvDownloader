@@ -1,0 +1,85 @@
+name: Windows CI
+
+# 这个项目是 net48 + WinForms + libVLC(x64) + System.Data.SQLite，
+# 只能在 Windows 上构建，所以 runner 固定 windows-latest。
+on:
+  push:
+    branches:
+      - main
+      - 'arena/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CONFIGURATION: Release
+  SOLUTION: KtvDownloader.sln
+
+jobs:
+  build-and-test:
+    name: 构建 + 单元测试
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: 还原 NuGet 包
+        run: msbuild $env:SOLUTION -t:restore -p:Configuration=$env:CONFIGURATION -v:minimal
+
+      - name: 编译
+        # -m 多核；把告警打出来（工程开了 GenerateDocumentationFile，
+        # cref 写错会以 CS1574 的形式在这里暴露）。
+        run: msbuild $env:SOLUTION -p:Configuration=$env:CONFIGURATION -p:Platform="Any CPU" -m -v:minimal -consoleloggerparameters:Summary
+
+      - name: 定位 vstest.console.exe
+        id: vstest
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "找不到 vswhere.exe" }
+
+          $installationPath = & $vswhere -latest -products * `
+            -requires Microsoft.Component.MSBuild `
+            -property installationPath | Select-Object -First 1
+
+          if (-not $installationPath) { throw "找不到 Visual Studio 安装路径" }
+
+          $console = Join-Path $installationPath `
+            "Common7\IDE\CommonExtensions\Microsoft\TestWindow\vstest.console.exe"
+
+          if (-not (Test-Path $console)) { throw "找不到 vstest.console.exe：$console" }
+
+          Write-Host "vstest.console.exe = $console"
+          "path=$console" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: 单元测试
+        # /Platform:x64 是必须的：被测工程锁定 x64（libVLC 只发布 x64），
+        # 默认 AnyCPU 的测试宿主在 32 位模式下加载会直接 BadImageFormatException。
+        run: |
+          & "${{ steps.vstest.outputs.path }}" `
+            "tests\KtvDownloader.Tests\bin\$env:CONFIGURATION\net48\KtvDownloader.Tests.dll" `
+            /Platform:x64 /Framework:Framework48 /Logger:"trx;LogFileName=results.trx" /Logger:"console;verbosity=normal"
+
+      - name: 上传测试结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/TestResults/*.trx'
+          if-no-files-found: warn
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: KtvDownloader-${{ env.CONFIGURATION }}
+          path: src/KtvDownloader/bin/${{ env.CONFIGURATION }}/net48/
+          if-no-files-found: error

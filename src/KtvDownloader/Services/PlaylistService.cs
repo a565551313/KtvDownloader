@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using KtvDownloader.Infrastructure.Config;
 using KtvDownloader.Infrastructure.Logging;
 using KtvDownloader.Models;
 using KtvDownloader.Services.Interfaces;
@@ -112,13 +113,14 @@ SELECT id, name, type, song_count, is_hq
                     using (var command = connection.CreateCommand())
                     {
                         // 通过 playlist_songs 关联 songs，保持歌单内的排序。
+                        //
+                        // ⚠️ 歌手名**不要**用相关子查询
+                        //    (SELECT group_concat(...) WHERE r.song_id = s.id)
+                        // 那是每行跑一次关联查询，一个上千首的歌单会慢到像是卡死
+                        // （docs §坑7 实测 +450ms/50 行）。改成取完歌曲后一条 IN 查询批量补。
                         command.CommandText = @"
 SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
-       s.hot_score, s.filename, s.accomp, s.mv_type, s.volume, s.tags_str,
-       (SELECT group_concat(sg.name, '/')
-          FROM song_singer_relations r
-          JOIN singers sg ON sg.id = r.singer_id
-         WHERE r.song_id = s.id) AS singer_names
+       s.hot_score, s.filename, s.accomp, s.mv_type, s.volume, s.tags_str
   FROM playlist_songs ps
   JOIN songs s ON s.id = ps.song_id
  WHERE ps.playlist_id = @playlistId
@@ -150,8 +152,21 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
                                     MvType = GetString(reader, 8),
                                     Volume = GetInt(reader, 9),
                                     Tags = SplitTags(GetString(reader, 10)),
-                                    Singer = GetString(reader, 11)
+                                    Singer = string.Empty
                                 });
+                            }
+                        }
+
+                        if (result.Count > 0)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            try
+                            {
+                                SingerNameLookup.Fill(connection, result);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.Warn("歌单批量补歌手名失败: " + ex.Message);
                             }
                         }
                     }
@@ -171,32 +186,13 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
             }, cancellationToken);
         }
 
+        /// <summary>
+        /// 把 tags_str（形如 ["高清歌曲","流行歌曲"]）解析成数组。
+        /// 统一用 <see cref="MiniJson.ParseStringArray"/>，不再各写一份解析器。
+        /// </summary>
         private static string[] SplitTags(string raw)
         {
-            if (string.IsNullOrWhiteSpace(raw)) return new string[0];
-
-            var tags = new List<string>();
-            var builder = new System.Text.StringBuilder();
-            var inString = false;
-
-            foreach (var c in raw)
-            {
-                if (c == '"')
-                {
-                    if (inString)
-                    {
-                        var tag = builder.ToString().Trim();
-                        if (tag.Length > 0) tags.Add(tag);
-                        builder.Length = 0;
-                    }
-                    inString = !inString;
-                    continue;
-                }
-
-                if (inString) builder.Append(c);
-            }
-
-            return tags.ToArray();
+            return MiniJson.ParseStringArray(raw);
         }
 
         private static string GetString(SQLiteDataReader reader, int index)

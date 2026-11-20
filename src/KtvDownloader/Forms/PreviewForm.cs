@@ -140,7 +140,7 @@ namespace KtvDownloader.Forms
                     progressBar.Value = Math.Max(0, Math.Min(100, p.Item1));
                 });
 
-                // 注意：这里传 ConvertToMp4=false 的语义 —— 只取解密后的 TS。
+                // 只做「取址 → 下载前 N 秒 → 解密」，产物是 .ts，交给 libVLC 直接播。
                 var source = await _previewService.PreparePlayableAsync(
                     _song, _durationSeconds, _cts.Token, progress);
 
@@ -207,30 +207,35 @@ namespace KtvDownloader.Forms
 
         /// <summary>
         /// 枚举音轨并填充下拉框。双音轨时允许切换。
+        /// <para>
+        /// 以 <see cref="VlcMediaPlayer.GetAudioTrackIds"/> 返回的**真实 id 数组**为准，
+        /// 而不是 <c>GetTrackCount()</c>：媒体刚打开的一瞬间 count 可能已经报 2，
+        /// 但描述链表还没建好，这时候拿 count 判断就会得到一份空数组，
+        /// 后面切音轨全失败。
+        /// </para>
         /// </summary>
         private void RefreshAudioTracks()
         {
             try
             {
-                var count = _player.GetTrackCount();
+                _audioTrackIds = _player.GetAudioTrackIds();
 
-                if (count < 2)
+                if (_audioTrackIds.Length < 2)
                 {
                     cboVocalMode.Enabled = false;
-                    _audioTrackIds = new int[0];
-                    lblStatus.Text = string.Format("正在播放（单音轨，无法切换）");
+                    lblStatus.Text = "正在播放（单音轨，无法切换）";
                     return;
                 }
 
-                _audioTrackIds = _player.GetAudioTrackIds();
                 cboVocalMode.Enabled = true;
 
                 // 应用当前选择（默认原唱 = 第 0 条）。
                 ApplyTrack(_currentTrackIndex);
 
-                lblStatus.Text = string.Format("正在播放（{0} 条音轨，可实时切换）", count);
+                lblStatus.Text = string.Format("正在播放（{0} 条音轨，可实时切换）", _audioTrackIds.Length);
                 _logger.Info(string.Format("检测到 {0} 条音轨: {1}",
-                    count, string.Join(",", Array.ConvertAll(_audioTrackIds, x => x.ToString()))));
+                    _audioTrackIds.Length,
+                    string.Join(",", Array.ConvertAll(_audioTrackIds, x => x.ToString()))));
             }
             catch (Exception ex)
             {

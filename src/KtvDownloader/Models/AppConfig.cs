@@ -38,6 +38,16 @@ namespace KtvDownloader.Models
         /// </summary>
         public int PreviewDurationSeconds { get; set; } = 60;
 
+        /// <summary>
+        /// 最低日志级别：<c>Debug</c> / <c>Info</c> / <c>Warn</c> / <c>Error</c>。
+        /// <para>
+        /// 默认 <c>Debug</c>（全记，和以前行为一致）。日常使用改成 <c>Warn</c>
+        /// 可以把日志体积压掉七成以上 —— 现在 <see cref="Infrastructure.Logging.FileLogger"/>
+        /// 是缓冲写，但行数少了刷盘次数也跟着少。
+        /// </para>
+        /// </summary>
+        public string LogLevel { get; set; } = "Debug";
+
         /// <summary>应用数据目录，固定为 %AppData%\KtvDownloader。</summary>
         public static string AppDataDirectory =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -77,9 +87,14 @@ namespace KtvDownloader.Models
             if (string.IsNullOrWhiteSpace(DefaultResolution))
                 DefaultResolution = "720";
 
-            // 预览时长：0 = 完整，否则限制在 10-600 秒之间。
+            // 预览时长：0 = 完整下载，否则必须在 10-600 秒之间。
+            // ⚠️ 原来的写法只挡了 <0 和 >600，1~9 这种值能直接穿过去 ——
+            // 而 <10 秒的预览切片经常连一个完整的 TS 关键帧都凑不齐，VLC 会黑屏或报错。
             if (PreviewDurationSeconds < 0) PreviewDurationSeconds = 60;
             if (PreviewDurationSeconds > 600) PreviewDurationSeconds = 600;
+            if (PreviewDurationSeconds > 0 && PreviewDurationSeconds < 10) PreviewDurationSeconds = 10;
+
+            if (string.IsNullOrWhiteSpace(LogLevel)) LogLevel = "Debug";
         }
     }
 }
