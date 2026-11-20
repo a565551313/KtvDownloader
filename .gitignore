@@ -1,0 +1,21 @@
+# 忽略编译产物
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userprefs
+.vs/
+*.log
+
+# NuGet
+packages/
+*.nupkg
+
+# 工具（体积大，不纳入版本控制）
+tools/ffmpeg.exe
+
+# 本地数据
+*.db
+*.db-shm
+*.db-wal
+downloads/
