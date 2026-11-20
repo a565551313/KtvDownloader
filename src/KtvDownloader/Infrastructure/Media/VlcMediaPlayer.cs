@@ -250,26 +250,84 @@ namespace KtvDownloader.Infrastructure.Media
         }
 
         /// <summary>
-        /// 取所有音轨的 ID 列表（用于在原唱/伴奏之间切换）。
-        /// libVLC 的音轨 ID 通常从 1 开始，0 是禁用。
+        /// 取 libVLC 报告的音轨描述列表（id + 名称），按 libVLC 给出的顺序。
+        /// <para>
+        /// 列表里 id 为 -1 的那一条是 libVLC 的「禁用音频」，不是音轨，这里原样返回，
+        /// 由调用方决定是否过滤（<see cref="GetAudioTrackIds"/> 会过滤）。
+        /// </para>
+        /// </summary>
+        public IList<VlcTrackDescription> GetAudioTrackDescriptions()
+        {
+            var result = new List<VlcTrackDescription>();
+            if (!IsAvailable || _player == IntPtr.Zero) return result;
+
+            // libvlc_track_description_t { int i_id; char *psz_name; struct *p_next; }
+            var head = IntPtr.Zero;
+            try
+            {
+                head = LibVlcNative.libvlc_audio_get_track_description(_player);
+
+                var node = head;
+                var guard = 0;
+                while (node != IntPtr.Zero && guard++ < 64)
+                {
+                    var id = Marshal.ReadInt32(node, 0);
+                    var namePtr = Marshal.ReadIntPtr(node, IntPtr.Size);
+                    var name = namePtr == IntPtr.Zero ? null : Marshal.PtrToStringAnsi(namePtr);
+
+                    result.Add(new VlcTrackDescription(id, name));
+
+                    node = Marshal.ReadIntPtr(node, IntPtr.Size * 2);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("VLC 读取音轨描述失败: " + ex.Message);
+            }
+            finally
+            {
+                // 链表是 libVLC 分配的原生内存，必须由它自己释放，否则每次枚举都漏一块。
+                if (head != IntPtr.Zero)
+                {
+                    try { LibVlcNative.libvlc_track_description_list_release(head); } catch { }
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// 取所有可用音轨的 ID 列表（用于在原唱/伴奏之间切换）。
+        /// <para>
+        /// ⚠️ 不要再用「当前 ID + 序号」递推。
+        /// KTV 的 TS 音轨 PID 并不保证连续（实测存在 257/259 这种跳号，
+        /// 中间那条被解码器自己占掉了），递推出来的第二个 ID 指向一个不存在的音轨，
+        /// <c>libvlc_audio_set_track</c> 返回 0（失败），表现就是"伴奏切不过去、一直放原唱"。
+        /// 正确做法是向 libVLC 要真实的 track description 链表。
+        /// </para>
+        /// <para>
+        /// 另：<c>libvlc_audio_get_track_id</c> 在 libvlc 3.x 里根本不存在
+        /// （属于早已废弃的 libvlc 0.9 API），之前那条 P/Invoke 一旦被真调用
+        /// 就是 <see cref="EntryPointNotFoundException"/>。
+        /// </para>
         /// </summary>
         public int[] GetAudioTrackIds()
         {
-            var count = GetTrackCount();
-            if (count <= 0) return new int[0];
+            var descriptions = GetAudioTrackDescriptions();
 
-            // 实测：libvlc_audio_get_track_id(player, i) 返回的 1/2/3 是描述序号，
-            // 而 libvlc_audio_set_track(player, id) 需要的是 TS 里的音轨 PID（257/258）。
-            // 由于 KTV 的 TS 音轨 PID 连续，这里以当前 PID 为基准递推。
-            var current = GetCurrentTrack();
-            var tracks = new int[count];
-
-            for (var i = 0; i < count; i++)
+            var ids = new List<int>(descriptions.Count);
+            foreach (var description in descriptions)
             {
-                tracks[i] = current + i;
+                // -1 = 「禁用音频」，不是音轨。
+                if (description.Id >= 0) ids.Add(description.Id);
             }
 
-            return tracks;
+            if (ids.Count > 0) return ids.ToArray();
+
+            // 兜底：媒体刚打开、还没进入 Playing 状态时描述链表可能为空。
+            // 至少返回当前音轨，别让调用方以为"这文件没有音轨"。
+            var current = GetCurrentTrack();
+            return current >= 0 ? new[] { current } : new int[0];
         }
 
         /// <summary>媒体总时长（毫秒）。未加载或未知时返回 0。</summary>
@@ -390,6 +448,33 @@ namespace KtvDownloader.Infrastructure.Media
     }
 
     /// <summary>
+    /// libVLC 报告的一条音轨信息。
+    /// <para>
+    /// <c>Id</c> 就是 <see cref="VlcMediaPlayer.SetAudioTrack"/> 需要的那个 id
+    /// （TS 场景下即 PID，可能是 257/259 这种不连续的值）；<c>-1</c> 表示「禁用音频」。
+    /// </para>
+    /// </summary>
+    public sealed class VlcTrackDescription
+    {
+        public VlcTrackDescription(int id, string name)
+        {
+            Id = id;
+            Name = name ?? string.Empty;
+        }
+
+        /// <summary>libVLC 内部音轨 id（TS 场景下即 PID）。</summary>
+        public int Id { get; private set; }
+
+        /// <summary>libVLC 给出的显示名，可能为空串。</summary>
+        public string Name { get; private set; }
+
+        public override string ToString()
+        {
+            return Id.ToString() + (Name.Length > 0 ? ":" + Name : string.Empty);
+        }
+    }
+
+    /// <summary>
     /// libvlc.dll 的最小 P/Invoke 声明。
     /// 只声明播放与音轨切换需要的那几个函数。
     /// </summary>
@@ -443,8 +528,15 @@ namespace KtvDownloader.Infrastructure.Media
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int libvlc_audio_set_track(IntPtr player, int track);
 
+        /// <summary>
+        /// 返回音轨描述链表（<c>libvlc_track_description_t*</c>）。
+        /// 调用方**必须**用 <see cref="libvlc_track_description_list_release"/> 释放。
+        /// </summary>
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int libvlc_audio_get_track_id(IntPtr player, int index);
+        public static extern IntPtr libvlc_audio_get_track_description(IntPtr player);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void libvlc_track_description_list_release(IntPtr description);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         public static extern long libvlc_media_player_get_length(IntPtr player);

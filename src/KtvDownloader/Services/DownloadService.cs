@@ -19,16 +19,24 @@ namespace KtvDownloader.Services
     /// 每个任务持有独立的 <see cref="IProgress{T}"/> 与 <see cref="CancellationToken"/>，
     /// 因此批量下载时每首歌都有各自独立的进度，互不干扰。
     /// </para>
+    /// <para>
+    /// 排队与并发不在这个类里，见 <see cref="DownloadQueue"/>。
+    /// 本类持有 <see cref="HttpClient"/>，因此实现了 <see cref="IDisposable"/>；
+    /// 重建服务时必须 Dispose 旧实例，否则连接池会一直泄漏。
+    /// </para>
     /// </summary>
-    public sealed class DownloadService : IDownloadService
+    public sealed class DownloadService : IDownloadService, IDisposable
     {
         private readonly ILogger _logger;
         private readonly ISongUrlService _urlService;
         private readonly ITsDecryptService _decryptService;
         private readonly IMediaService _mediaService;
-        private readonly HttpClient _httpClient;
+        private HttpClient _httpClient;
 
         private int _maxConcurrency = 2;
+
+        /// <summary>0 = 未释放，1 = 已释放。用 int 才能配合 <see cref="Interlocked"/> 做原子交换。</summary>
+        private int _disposed;
 
         public DownloadService(
             ILogger logger,
@@ -57,12 +65,27 @@ namespace KtvDownloader.Services
             set { _maxConcurrency = Math.Max(1, Math.Min(8, value)); }
         }
 
-        /// <summary>由队列维护，这里仅供界面显示用。</summary>
-        public int ActiveTaskCount { get; internal set; }
-
-        public void CancelAll()
+        public void Dispose()
         {
-            // 实际的取消由队列对每个任务各自的 CancellationTokenSource 完成。
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+            var client = _httpClient;
+            _httpClient = null;
+            if (client != null)
+            {
+                try { client.Dispose(); } catch { }
+            }
+        }
+
+        /// <summary>取当前的 HttpClient，已释放时抛异常（避免 NullReferenceException）。</summary>
+        private HttpClient Client
+        {
+            get
+            {
+                var client = _httpClient;
+                if (client == null) throw new ObjectDisposedException(nameof(DownloadService));
+                return client;
+            }
         }
 
         public async Task<DownloadTask> ExecuteAsync(
@@ -73,6 +96,8 @@ namespace KtvDownloader.Services
         {
             if (task == null) throw new ArgumentNullException(nameof(task));
             if (options == null) throw new ArgumentNullException(nameof(options));
+            if (Volatile.Read(ref _disposed) != 0)
+                throw new ObjectDisposedException(nameof(DownloadService));
 
             try
             {
@@ -88,7 +113,7 @@ namespace KtvDownloader.Services
                     return Fail(task, "取址失败：" + urlResult.Error, progress);
                 }
 
-                var safeBaseName = BuildBaseFileName(task.Song);
+                var safeBaseName = SongFileNaming.BuildBaseFileName(task.Song);
                 if (!Directory.Exists(task.OutputDirectory))
                     Directory.CreateDirectory(task.OutputDirectory);
 
@@ -218,7 +243,7 @@ namespace KtvDownloader.Services
             {
                 request.Headers.TryAddWithoutValidation("Accept", "*/*");
 
-                using (var response = await _httpClient.SendAsync(
+                using (var response = await Client.SendAsync(
                     request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false))
                 {
                     if (!response.IsSuccessStatusCode)
@@ -296,8 +321,7 @@ namespace KtvDownloader.Services
             {
                 var finalPath = Path.Combine(outputDirectory,
                     safeBaseName + Path.GetExtension(sourcePath));
-                if (File.Exists(finalPath)) SafeDelete(finalPath);
-                File.Move(sourcePath, finalPath);
+                MoveOver(sourcePath, finalPath);
                 return finalPath;
             }
 
@@ -306,8 +330,7 @@ namespace KtvDownloader.Services
                 _logger.Warn("ffmpeg 不可用，保留原始文件");
                 var fallback = Path.Combine(outputDirectory,
                     safeBaseName + Path.GetExtension(sourcePath));
-                if (File.Exists(fallback)) SafeDelete(fallback);
-                File.Move(sourcePath, fallback);
+                MoveOver(sourcePath, fallback);
                 return fallback;
             }
 
@@ -326,13 +349,18 @@ namespace KtvDownloader.Services
 
                 var split = await _mediaService.SplitVocalAsync(
                     sourcePath, outputDirectory, safeBaseName, options.Vocal,
-                    options.AudioBitrateKbps, cancellationToken).ConfigureAwait(false);
+                    options.AudioBitrateKbps, task.Song.Accomp, cancellationToken)
+                    .ConfigureAwait(false);
 
                 if (split.HasAny)
                 {
                     var produced = split.GetAllPaths();
-                    _logger.Info("音轨分离产出 " + produced.Length + " 个文件");
-                    return produced[0];
+                    _logger.Info("音轨分离产出 " + produced.Length + " 个文件: " +
+                                 string.Join(" | ", produced));
+
+                    // 返回给队列的那一条要稳定：优先原唱版，没有再取伴奏版。
+                    // 之前是 produced[0]，顺序取决于枚举实现，界面显示的成品路径会飘。
+                    return split.OriginalPath ?? split.AccompanimentPath;
                 }
 
                 // 分离失败则退回普通转码。
@@ -350,16 +378,6 @@ namespace KtvDownloader.Services
         #endregion
 
         #region 工具
-
-        private static string BuildBaseFileName(Song song)
-        {
-            var name = song.Singer.HasValue()
-                ? song.Name + "-" + song.Singer
-                : song.Name;
-
-            var safe = name.ToSafeFileName(100);
-            return safe.Length > 0 ? safe : song.MusicNo;
-        }
 
         private static string GuessExtension(string url, Song song)
         {
@@ -401,6 +419,43 @@ namespace KtvDownloader.Services
             progress?.Report(new DownloadProgress(DownloadState.Failed, task.BytesReceived,
                 task.TotalBytes, task.StatusText));
             return task;
+        }
+
+        /// <summary>
+        /// 把 <paramref name="sourcePath"/> 移到 <paramref name="targetPath"/>，目标已存在时覆盖 ——
+        /// 但**一定会记一条 WARN**。
+        /// <para>
+        /// 原来这里是 <c>if (File.Exists(x)) SafeDelete(x); File.Move(...);</c>：
+        /// 一声不吭就把用户之前下好的同名文件删掉了。同名不同内容完全可能
+        /// （曲库更新后歌号变了、用户手工改过文件名、或者上次下的是伴奏这次要原唱），
+        /// 删了还查不到痕迹，只能靠用户自己发现"咦我那首歌呢"。
+        /// </para>
+        /// </summary>
+        private void MoveOver(string sourcePath, string targetPath)
+        {
+            if (File.Exists(targetPath))
+            {
+                long oldSize = 0;
+                long newSize = 0;
+                try
+                {
+                    oldSize = new FileInfo(targetPath).Length;
+                    if (File.Exists(sourcePath)) newSize = new FileInfo(sourcePath).Length;
+                }
+                catch
+                {
+                    // 拿不到大小不影响覆盖本身。
+                }
+
+                _logger.Warn(string.Format("目标文件已存在，将被覆盖: {0}（{1} → {2}）",
+                    targetPath,
+                    Models.DownloadProgress.FormatSize(oldSize),
+                    Models.DownloadProgress.FormatSize(newSize)));
+
+                SafeDelete(targetPath);
+            }
+
+            File.Move(sourcePath, targetPath);
         }
 
         private static void SafeDelete(string path)

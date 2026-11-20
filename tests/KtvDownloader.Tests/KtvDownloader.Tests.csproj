@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <AssemblyName>KtvDownloader.Tests</AssemblyName>
+    <RootNamespace>KtvDownloader.Tests</RootNamespace>
+
+    <!-- 被测工程锁定 x64（libVLC 只发布 x64），测试宿主必须跟着走 x64，
+         否则加载 KtvDownloader.exe 时会报 BadImageFormatException。 -->
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
+    <PackageReference Include="MSTest.TestAdapter" Version="3.1.1" />
+    <PackageReference Include="MSTest.TestFramework" Version="3.1.1" />
+
+    <!-- 显式引一份：NuGet 的 build/ 目标（负责把 SQLite.Interop.dll 拷到输出目录）
+         **不会**顺着 ProjectReference 传递过来，只靠主工程引用的话，
+         测试进程里一旦真的去 open 一个 SQLite 连接就会报"找不到 SQLite.Interop.dll"。
+         现在的测试都是纯逻辑、不连库，但把这份保险留着，
+         将来加"用临时曲库跑真查询"的集成测试时不会踩坑。 -->
+    <PackageReference Include="System.Data.SQLite.Core" Version="1.0.119" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\KtvDownloader\KtvDownloader.csproj" />
+  </ItemGroup>
+
+</Project>

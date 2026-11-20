@@ -6,6 +6,7 @@ using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using KtvDownloader.Infrastructure.Config;
 using KtvDownloader.Infrastructure.Logging;
 using KtvDownloader.Models;
 using KtvDownloader.Services.Interfaces;
@@ -79,6 +80,8 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
                 {
                     lock (_connectionLock)
                     {
+                        if (!HasConnectionLocked) return 0;
+
                         using (var command = _connection.CreateCommand())
                         {
                             command.CommandText = "SELECT COUNT(*) FROM songs WHERE deleted_at IS NULL";
@@ -89,7 +92,10 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
                 catch (Exception ex)
                 {
                     _logger.Error("统计歌曲总数失败", ex);
-                    _totalSongCount = 0;
+                    // ⚠️ 不能把失败结果缓存成 0：getter 是 ">= 0 就直接返回"，
+                    // 一次瞬时失败（例如曲库正在被更新替换）会让主界面永久显示"0 首"直到重启。
+                    _totalSongCount = -1;
+                    return 0;
                 }
 
                 return _totalSongCount;
@@ -103,53 +109,71 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
             int limit,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            return Task.Run<IReadOnlyList<Song>>(() =>
+            return Task.Run<IReadOnlyList<Song>>(
+                () => SearchSongsCore(keyword, language, offset, limit, cancellationToken),
+                cancellationToken);
+        }
+
+        /// <summary>
+        /// 按歌名搜索的同步实现。
+        /// <para>
+        /// 抽成 Core 是为了消除 sync-over-async：<see cref="GetAllMatchesAsync"/> 本身已经跑在
+        /// 线程池线程上，早期它在里面用 <c>.GetAwaiter().GetResult()</c> 调异步方法，
+        /// 等于"一个线程池线程阻塞等另一个线程池线程"，预取 5000 条要这样嵌套十次，
+        /// 并发一高就是线程池饥饿。
+        /// </para>
+        /// </summary>
+        private IReadOnlyList<Song> SearchSongsCore(
+            string keyword,
+            string language,
+            int offset,
+            int limit,
+            CancellationToken cancellationToken)
+        {
+            var trimmed = (keyword ?? string.Empty).Trim();
+            if (trimmed.Length == 0) return new List<Song>();
+
+            if (!TryEnsureConnection()) return new List<Song>();
+
+            try
             {
-                var trimmed = (keyword ?? string.Empty).Trim();
-                if (trimmed.Length == 0) return new List<Song>();
+                var builder = new StringBuilder(SongSelect);
+                var parameters = new List<SQLiteParameter>();
 
-                if (!TryEnsureConnection()) return new List<Song>();
-
-                try
+                if (IsAscii(trimmed))
                 {
-                    var builder = new StringBuilder(SongSelect);
-                    var parameters = new List<SQLiteParameter>();
-
-                    if (IsAscii(trimmed))
-                    {
-                        // 拼音/英文：前缀 GLOB，走索引。
-                        var pattern = trimmed.ToUpperInvariant().Replace("[", "[[]") + "*";
-                        builder.Append(" AND (s.name_cap GLOB @kwCap OR s.name_full GLOB @kwFull)");
-                        parameters.Add(new SQLiteParameter("@kwCap", pattern));
-                        parameters.Add(new SQLiteParameter("@kwFull", pattern));
-                    }
-                    else
-                    {
-                        // 中文：LIKE 全表扫，只匹配中文列。
-                        builder.Append(" AND (s.name LIKE @kw OR s.name_trim LIKE @kwTrim)");
-                        parameters.Add(new SQLiteParameter("@kw", "%" + trimmed + "%"));
-                        parameters.Add(new SQLiteParameter("@kwTrim", "%" + trimmed + "%"));
-                    }
-
-                    AppendLanguageFilter(builder, parameters, language);
-
-                    builder.Append(OrderClause);
-                    builder.Append(" LIMIT @limit OFFSET @offset");
-                    parameters.Add(new SQLiteParameter("@limit", Math.Max(1, limit)));
-                    parameters.Add(new SQLiteParameter("@offset", Math.Max(0, offset)));
-
-                    return QuerySongs(builder.ToString(), parameters, cancellationToken);
+                    // 拼音/英文：前缀 GLOB，走索引。
+                    var pattern = trimmed.ToUpperInvariant().Replace("[", "[[]") + "*";
+                    builder.Append(" AND (s.name_cap GLOB @kwCap OR s.name_full GLOB @kwFull)");
+                    parameters.Add(new SQLiteParameter("@kwCap", pattern));
+                    parameters.Add(new SQLiteParameter("@kwFull", pattern));
                 }
-                catch (OperationCanceledException)
+                else
                 {
-                    throw;
+                    // 中文：LIKE 全表扫，只匹配中文列。
+                    builder.Append(" AND (s.name LIKE @kw OR s.name_trim LIKE @kwTrim)");
+                    parameters.Add(new SQLiteParameter("@kw", "%" + trimmed + "%"));
+                    parameters.Add(new SQLiteParameter("@kwTrim", "%" + trimmed + "%"));
                 }
-                catch (Exception ex)
-                {
-                    _logger.Error("搜索歌曲失败 keyword=" + trimmed, ex);
-                    return new List<Song>();
-                }
-            }, cancellationToken);
+
+                AppendLanguageFilter(builder, parameters, language);
+
+                builder.Append(OrderClause);
+                builder.Append(" LIMIT @limit OFFSET @offset");
+                parameters.Add(new SQLiteParameter("@limit", Math.Max(1, limit)));
+                parameters.Add(new SQLiteParameter("@offset", Math.Max(0, offset)));
+
+                return QuerySongs(builder.ToString(), parameters, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("搜索歌曲失败 keyword=" + trimmed, ex);
+                return new List<Song>();
+            }
         }
 
         public Task<IReadOnlyList<Song>> SearchBySingerAsync(
@@ -158,44 +182,53 @@ SELECT s.id, s.tid, s.name, s.name_trim, s.lang,
             int limit,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            return Task.Run<IReadOnlyList<Song>>(() =>
+            return Task.Run<IReadOnlyList<Song>>(
+                () => SearchBySingerCore(keyword, offset, limit, cancellationToken),
+                cancellationToken);
+        }
+
+        /// <summary>按歌手搜索的同步实现，理由同 <see cref="SearchSongsCore"/>。</summary>
+        private IReadOnlyList<Song> SearchBySingerCore(
+            string keyword,
+            int offset,
+            int limit,
+            CancellationToken cancellationToken)
+        {
+            var trimmed = (keyword ?? string.Empty).Trim();
+            if (trimmed.Length == 0) return new List<Song>();
+            if (!TryEnsureConnection()) return new List<Song>();
+
+            try
             {
-                var trimmed = (keyword ?? string.Empty).Trim();
-                if (trimmed.Length == 0) return new List<Song>();
-                if (!TryEnsureConnection()) return new List<Song>();
+                var builder = new StringBuilder(SongSelect);
+                var parameters = new List<SQLiteParameter>();
 
-                try
-                {
-                    var builder = new StringBuilder(SongSelect);
-                    var parameters = new List<SQLiteParameter>();
+                builder.Append(@" AND s.id IN (
+SELECT r.song_id
+  FROM song_singer_relations r
+  JOIN singers sg ON sg.id = r.singer_id
+ WHERE sg.name LIKE @singer OR sg.name_trim LIKE @singerTrim)");
 
-                    builder.Append(@" AND s.id IN (
-    SELECT r.song_id
-      FROM song_singer_relations r
-      JOIN singers sg ON sg.id = r.singer_id
-     WHERE sg.name LIKE @singer OR sg.name_trim LIKE @singerTrim)");
+                var pattern = "%" + trimmed + "%";
+                parameters.Add(new SQLiteParameter("@singer", pattern));
+                parameters.Add(new SQLiteParameter("@singerTrim", pattern));
 
-                    var pattern = "%" + trimmed + "%";
-                    parameters.Add(new SQLiteParameter("@singer", pattern));
-                    parameters.Add(new SQLiteParameter("@singerTrim", pattern));
+                builder.Append(OrderClause);
+                builder.Append(" LIMIT @limit OFFSET @offset");
+                parameters.Add(new SQLiteParameter("@limit", Math.Max(1, limit)));
+                parameters.Add(new SQLiteParameter("@offset", Math.Max(0, offset)));
 
-                    builder.Append(OrderClause);
-                    builder.Append(" LIMIT @limit OFFSET @offset");
-                    parameters.Add(new SQLiteParameter("@limit", Math.Max(1, limit)));
-                    parameters.Add(new SQLiteParameter("@offset", Math.Max(0, offset)));
-
-                    return QuerySongs(builder.ToString(), parameters, cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.Error("按歌手搜索失败 keyword=" + trimmed, ex);
-                    return new List<Song>();
-                }
-            }, cancellationToken);
+                return QuerySongs(builder.ToString(), parameters, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("按歌手搜索失败 keyword=" + trimmed, ex);
+                return new List<Song>();
+            }
         }
 
         public Task<IReadOnlyList<Singer>> SearchSingersAsync(
@@ -242,6 +275,8 @@ SELECT id, name, name_cap, name_full, name_trim, image, type, area, hot_score
                     var result = new List<Singer>();
                     lock (_connectionLock)
                     {
+                        if (!HasConnectionLocked) return result;
+
                         using (var command = _connection.CreateCommand())
                         {
                             command.CommandText = builder.ToString();
@@ -343,6 +378,8 @@ SELECT id, name, name_cap, name_full, name_trim, image, type, area, hot_score
                 {
                     lock (_connectionLock)
                     {
+                        if (!HasConnectionLocked) return result;
+
                         using (var command = _connection.CreateCommand())
                         {
                             command.CommandText =
@@ -427,10 +464,10 @@ SELECT id, name, name_cap, name_full, name_trim, image, type, area, hot_score
                 if (!TryEnsureConnection()) return new List<Song>();
 
                 // 只有歌手没有歌名 -> 退化为按歌手搜索。
+                // 这里已经在线程池线程上，直接调同步 Core，不要嵌套等待异步方法。
                 if (song.Length == 0)
                 {
-                    return SearchBySingerAsync(singer, offset, limit, cancellationToken)
-                        .GetAwaiter().GetResult();
+                    return SearchBySingerCore(singer, offset, limit, cancellationToken);
                 }
 
                 try
@@ -497,6 +534,8 @@ SELECT id, name, name_cap, name_full, name_trim, image, type, area, hot_score
                 {
                     lock (_connectionLock)
                     {
+                        if (!HasConnectionLocked) return false;
+
                         using (var command = _connection.CreateCommand())
                         {
                             command.CommandText =
@@ -551,6 +590,8 @@ SELECT COUNT(*) FROM songs s
 
                     lock (_connectionLock)
                     {
+                        if (!HasConnectionLocked) return 0;
+
                         using (var command = _connection.CreateCommand())
                         {
                             command.CommandText = builder.ToString();
@@ -646,6 +687,8 @@ SELECT COUNT(*) FROM songs s
                 {
                     lock (_connectionLock)
                     {
+                        if (!HasConnectionLocked) return result;
+
                         // 从 tag_groups 取标准标签集合，比扫全表 tags_str 快得多。
                         using (var command = _connection.CreateCommand())
                         {
@@ -761,6 +804,8 @@ SELECT COUNT(*) FROM songs s
 
                     lock (_connectionLock)
                     {
+                        if (!HasConnectionLocked) return 0;
+
                         using (var command = _connection.CreateCommand())
                         {
                             command.CommandText = builder.ToString();
@@ -798,11 +843,10 @@ SELECT COUNT(*) FROM songs s
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
+                        // 已经在 Task.Run 里，直接调同步 Core，避免线程池自己等自己。
                         var page = bySinger
-                            ? SearchBySingerAsync(trimmed, all.Count, PageSize, cancellationToken)
-                                  .GetAwaiter().GetResult()
-                            : SearchSongsAsync(trimmed, language, all.Count, PageSize, cancellationToken)
-                                  .GetAwaiter().GetResult();
+                            ? SearchBySingerCore(trimmed, all.Count, PageSize, cancellationToken)
+                            : SearchSongsCore(trimmed, language, all.Count, PageSize, cancellationToken);
 
                         if (page.Count == 0) break;
 
@@ -827,20 +871,29 @@ SELECT COUNT(*) FROM songs s
 
         #region 内部实现
         /// <summary>确认连接可用。曲库文件可能被删除或替换，所以每次都要校验。</summary>
+        /// <summary>
+        /// 确认连接可用。曲库文件可能被删除或替换，所以每次都要校验。
+        /// <para>
+        /// ⚠️ 所有判断与释放都必须在 <see cref="_connectionLock"/> 内完成。
+        /// 早期版本在锁外读 <c>_connection.State</c> 并在文件消失时调 Dispose()，
+        /// 而 <see cref="QuerySongs"/> 拿到锁后直接用 <c>_connection</c> 且不判空，
+        /// 于是曲库更新的一瞬间并发查询会撞上 NullReferenceException。
+        /// </para>
+        /// </summary>
         private bool TryEnsureConnection()
         {
-            if (_initialized && _connection != null && _connection.State == System.Data.ConnectionState.Open)
-            {
-                if (File.Exists(_databasePath)) return true;
-
-                // 文件不在了，释放连接。
-                Dispose();
-                return false;
-            }
-
             lock (_connectionLock)
             {
-                if (_connection != null) return true;
+                if (_initialized && HasConnectionLocked)
+                {
+                    if (File.Exists(_databasePath)) return true;
+
+                    // 文件不在了，释放连接（已在锁内，直接内联清理）。
+                    CloseConnectionLocked();
+                    return false;
+                }
+
+                if (HasConnectionLocked) return true;
 
                 if (string.IsNullOrWhiteSpace(_databasePath) || !File.Exists(_databasePath))
                 {
@@ -884,6 +937,8 @@ SELECT COUNT(*) FROM songs s
 
             lock (_connectionLock)
             {
+                if (!HasConnectionLocked) return result;
+
                 using (var command = _connection.CreateCommand())
                 {
                     command.CommandText = sql;
@@ -914,51 +969,14 @@ SELECT COUNT(*) FROM songs s
 
         /// <summary>
         /// 一次性查出这批歌曲的所有歌手名，填回 <see cref="Song.Singer"/>。
+        /// 实现见 <see cref="SingerNameLookup"/>（内部按 400 个 id 分块，
+        /// 避免撞上 SQLite 的绑定变量上限）。
         /// </summary>
         private void FillSingerNames(List<Song> songs, List<string> ids)
         {
             try
             {
-                var placeholders = string.Join(",", System.Linq.Enumerable.Repeat("?", ids.Count));
-
-                var sql = @"
-SELECT r.song_id, group_concat(sg.name, '/')
-  FROM song_singer_relations r
-  JOIN singers sg ON sg.id = r.singer_id
- WHERE r.song_id IN (" + placeholders + @")
-   AND r.deleted_at IS NULL
- GROUP BY r.song_id";
-
-                var map = new Dictionary<string, string>(ids.Count);
-
-                using (var command = _connection.CreateCommand())
-                {
-                    command.CommandText = sql;
-                    // SQLite 的 ? 是位置参数，直接按顺序追加即可。
-                    foreach (var id in ids)
-                    {
-                        var param = command.CreateParameter();
-                        param.DbType = System.Data.DbType.String;
-                        param.Value = id;
-                        command.Parameters.Add(param);
-                    }
-
-                    using (var reader = command.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            if (reader.IsDBNull(0) || reader.IsDBNull(1)) continue;
-                            map[reader.GetString(0)] = reader.GetString(1);
-                        }
-                    }
-                }
-
-                foreach (var song in songs)
-                {
-                    string names;
-                    if (song.Id != null && map.TryGetValue(song.Id, out names))
-                        song.Singer = NormalizeSinger(names);
-                }
+                SingerNameLookup.Fill(_connection, songs);
             }
             catch (Exception ex)
             {
@@ -1027,52 +1045,12 @@ SELECT r.song_id, group_concat(sg.name, '/')
         }
 
         /// <summary>
-        /// 把 tags_str（形如 ["高清歌曲","流行歌曲"]）解析成数组。
-        /// 手写解析避免引入 JSON 依赖。
+        /// 把 tags_str（形如 <c>["高清歌曲","流行歌曲"]</c>）解析成数组。
+        /// 统一用 <see cref="MiniJson.ParseStringArray"/>，不再各写一份解析器。
         /// </summary>
         private static string[] SplitTags(string raw)
         {
-            if (string.IsNullOrWhiteSpace(raw)) return new string[0];
-
-            var tags = new List<string>();
-            var builder = new StringBuilder();
-            var inString = false;
-
-            for (var i = 0; i < raw.Length; i++)
-            {
-                var c = raw[i];
-
-                if (c == '"')
-                {
-                    if (inString)
-                    {
-                        var tag = builder.ToString().Trim();
-                        if (tag.Length > 0) tags.Add(tag);
-                        builder.Length = 0;
-                    }
-                    inString = !inString;
-                    continue;
-                }
-
-                if (inString) builder.Append(c);
-            }
-
-            return tags.ToArray();
-        }
-
-        /// <summary>歌手名可能带空白或重复分隔符，统一成「A/B」形式。</summary>
-        private static string NormalizeSinger(string raw)
-        {
-            if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
-
-            var parts = raw.Split(new[] { '/', '、' }, StringSplitOptions.RemoveEmptyEntries);
-            var cleaned = new List<string>(parts.Length);
-            foreach (var part in parts)
-            {
-                var value = part.Trim();
-                if (value.Length > 0 && !cleaned.Contains(value)) cleaned.Add(value);
-            }
-            return string.Join("/", cleaned.ToArray());
+            return MiniJson.ParseStringArray(raw);
         }
 
         private static string GetString(SQLiteDataReader reader, int index)
@@ -1099,15 +1077,31 @@ SELECT r.song_id, group_concat(sg.name, '/')
         {
             lock (_connectionLock)
             {
-                if (_connection != null)
-                {
-                    try { _connection.Close(); } catch { }
-                    try { _connection.Dispose(); } catch { }
-                    _connection = null;
-                }
-                _initialized = false;
-                _totalSongCount = -1;
+                CloseConnectionLocked();
             }
+        }
+
+        /// <summary>连接是否可用。**只能在持有 <see cref="_connectionLock"/> 时调用**。</summary>
+        private bool HasConnectionLocked
+        {
+            get
+            {
+                return _connection != null &&
+                       _connection.State == System.Data.ConnectionState.Open;
+            }
+        }
+
+        /// <summary>关闭并清空连接。**只能在持有 <see cref="_connectionLock"/> 时调用**。</summary>
+        private void CloseConnectionLocked()
+        {
+            if (_connection != null)
+            {
+                try { _connection.Close(); } catch { }
+                try { _connection.Dispose(); } catch { }
+                _connection = null;
+            }
+            _initialized = false;
+            _totalSongCount = -1;
         }
     }
 }

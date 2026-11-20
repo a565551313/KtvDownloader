@@ -21,13 +21,27 @@ namespace KtvDownloader.Services
     /// <item>头[457]：第一个加密段号</item>
     /// </list>
     /// 解密条件：interval==0 则全解；否则 seg==first 或 (seg&gt;first 且 seg%interval==1)。
-    /// 每段用 AES-128-ECB/NoPadding 解前 (len - len%16) 字节，尾部原样保留。
+    /// 每段用 AES-ECB/NoPadding 解前 (len - len%16) 字节，尾部原样保留。
+    /// </para>
+    /// <para>
+    /// ⚠️ 密钥长度：内置密钥表每项是 **64 个十六进制字符 = 32 字节**，
+    /// 所以实际是 **AES-256**-ECB，不是早期文档写的 AES-128。
+    /// 照 AES-128 重写实现会直接抛 <c>CryptographicException</c>（密钥长度非法）。
     /// </para>
     /// </summary>
     public sealed class TsDecryptService : ITsDecryptService
     {
         private const int HeaderSize = 512;
         private const int TsPacketSize = 188;
+
+        /// <summary>签名在私有头里的偏移。</summary>
+        private const int SignatureOffset = 500;
+
+        /// <summary>签名长度（THUNDERCRYP3 等均为 12 字节）。</summary>
+        private const int SignatureLength = 12;
+
+        /// <summary>AES 分组大小。</summary>
+        private const int AesBlockSize = 16;
 
         private readonly ILogger _logger;
 
@@ -109,8 +123,16 @@ namespace KtvDownloader.Services
         }
 
         /// <summary>
-        /// 判断是否加密 TS。
-        /// 判据：首字节不是 0x47（TS 同步字节），或者头部签名匹配。
+        /// 判断是否为我们**能解密**的加密 TS。
+        /// <para>
+        /// 判据只有一个：头[500..512] 命中已知签名（THUNDERCRYP3 / HHCMUSECRYP1 / HHCMUSECRYP2）。
+        /// </para>
+        /// <para>
+        /// ⚠️ 不要用"首字节不是 0x47 就当加密"：曲库里还有 1,157 首 <c>.mp3</c> 与
+        /// 8,488 首 <c>.ls/.kls</c>（docs §5.4），它们的首字节当然不是 TS 同步字节，
+        /// 一旦被误判为加密，后续解密必然因签名不匹配失败，整首歌就被判成"下载失败"。
+        /// 非 TS 内容一律原样透传，交给后面的 ffmpeg / 播放器处理。
+        /// </para>
         /// </summary>
         public static bool IsEncrypted(string filePath)
         {
@@ -123,28 +145,23 @@ namespace KtvDownloader.Services
                     if (stream.Length < HeaderSize) return false;
 
                     var header = new byte[HeaderSize];
-                    var read = 0;
-                    while (read < HeaderSize)
-                    {
-                        var count = stream.Read(header, read, HeaderSize - read);
-                        if (count <= 0) break;
-                        read += count;
-                    }
+                    if (!TryReadExactly(stream, header, HeaderSize)) return false;
 
-                    if (read < HeaderSize) return false;
-
-                    // 首字节不是 TS 同步字节 → 加密（或未知格式）。
-                    if (header[0] != 0x47) return true;
-
-                    var signature = new byte[12];
-                    Buffer.BlockCopy(header, 500, signature, 0, 12);
-                    return IsKnownSignature(signature);
+                    return IsKnownSignature(ExtractSignature(header));
                 }
             }
             catch
             {
                 return false;
             }
+        }
+
+        /// <summary>取头[500..512] 的 12 字节签名。</summary>
+        private static byte[] ExtractSignature(byte[] header)
+        {
+            var signature = new byte[SignatureLength];
+            Buffer.BlockCopy(header, SignatureOffset, signature, 0, SignatureLength);
+            return signature;
         }
 
         public Task<bool> DecryptAsync(
@@ -180,10 +197,13 @@ namespace KtvDownloader.Services
                     }
 
                     var header = new byte[HeaderSize];
-                    ReadExactly(input, header, HeaderSize);
+                    if (!TryReadExactly(input, header, HeaderSize))
+                    {
+                        _logger.Warn("私有头读取不完整，不是加密 TS: " + sourcePath);
+                        return false;
+                    }
 
-                    var signature = new byte[12];
-                    Buffer.BlockCopy(header, 500, signature, 0, 12);
+                    var signature = ExtractSignature(header);
 
                     var keyTable = ResolveKeyTable(signature);
                     if (keyTable == null)
@@ -237,7 +257,7 @@ namespace KtvDownloader.Services
 
                                 if (ShouldDecrypt(segmentIndex, firstEncryptedSegment, interval))
                                 {
-                                    var encryptedLength = count - (count % 16);
+                                    var encryptedLength = count - (count % AesBlockSize);
                                     if (encryptedLength > 0)
                                     {
                                         // ECB 无状态，可以反复用同一个 transform 逐段处理。
@@ -307,7 +327,11 @@ namespace KtvDownloader.Services
             }
         }
 
-        private static bool ShouldDecrypt(long segmentIndex, int firstEncryptedSegment, int interval)
+        /// <summary>
+        /// 该段是否需要解密。
+        /// interval==0 → 每段都加密；否则命中首段，或 (seg&gt;first 且 seg%interval==1)。
+        /// </summary>
+        internal static bool ShouldDecrypt(long segmentIndex, int firstEncryptedSegment, int interval)
         {
             if (interval == 0) return true;
             if (segmentIndex == firstEncryptedSegment) return true;
@@ -363,7 +387,11 @@ namespace KtvDownloader.Services
             }
         }
 
-        private static void ReadExactly(Stream stream, byte[] buffer, int count)
+        /// <summary>
+        /// 读满 count 字节。返回是否真的读满 —— 调用方**必须**检查返回值，
+        /// 否则短读时会拿着半截全零的私有头继续解析，得出荒谬的段大小/密钥索引。
+        /// </summary>
+        private static bool TryReadExactly(Stream stream, byte[] buffer, int count)
         {
             var offset = 0;
             while (offset < count)
@@ -372,6 +400,7 @@ namespace KtvDownloader.Services
                 if (read <= 0) break;
                 offset += read;
             }
+            return offset == count;
         }
 
         /// <summary>尽量填满缓冲区，返回实际读到的字节数。</summary>
@@ -429,5 +458,44 @@ namespace KtvDownloader.Services
                 // 忽略。
             }
         }
+
+        #region 测试钩子
+
+        // 以下成员只给单元测试用（配合 AssemblyInfo 里的 InternalsVisibleTo）。
+        // 有了它们，测试可以自己构造一个"512 字节私有头 + AES 分段加密"的样本文件，
+        // 跑完整的解密回环，而不需要真的去源站下一首歌。
+
+        /// <summary>私有头长度（512）。</summary>
+        internal const int PrivateHeaderSize = HeaderSize;
+
+        /// <summary>Thunder 签名的副本。</summary>
+        internal static byte[] ThunderSignature
+        {
+            get { return (byte[])SignatureThunder.Clone(); }
+        }
+
+        /// <summary>HHC1 签名的副本。</summary>
+        internal static byte[] Hhc1Signature
+        {
+            get { return (byte[])SignatureHhc1.Clone(); }
+        }
+
+        /// <summary>HHC2 签名的副本。</summary>
+        internal static byte[] Hhc2Signature
+        {
+            get { return (byte[])SignatureHhc2.Clone(); }
+        }
+
+        /// <summary>
+        /// 按签名与密钥索引取 AES 密钥。返回 32 字节（AES-256）；签名不认识时返回 null。
+        /// </summary>
+        internal static byte[] GetKey(byte[] signature, int keyIndex)
+        {
+            var table = ResolveKeyTable(signature);
+            if (table == null) return null;
+            return HexToBytes(table[keyIndex & 0x0F]);
+        }
+
+        #endregion
     }
 }

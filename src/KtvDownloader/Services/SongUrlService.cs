@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using KtvDownloader.Infrastructure.Config;
 using KtvDownloader.Infrastructure.Http;
 using KtvDownloader.Infrastructure.Logging;
 using KtvDownloader.Services.Interfaces;
@@ -19,19 +20,13 @@ namespace KtvDownloader.Services
     /// 3. ls 只试 1，其它值会被直接拒绝。
     /// 4. 403 通常是限流而非 token 过期，同 token 短退避重试即可。
     /// </para>
+    /// <para>
+    /// appid / 密钥 / 设备号 / 源站列表都在 <see cref="ProtocolCredentials"/>，
+    /// 可以用 <c>%AppData%\KtvDownloader\credentials.json</c> 覆盖，无需改代码重编译。
+    /// </para>
     /// </summary>
     public sealed class SongUrlService : ISongUrlService
     {
-        private const string AppId = "d4eeacc6cec3434fbc8c41608a3056a0";
-        private const string AppKey = "024210cba40d4385a93e6c2d3249bfb5";
-        private const string SdkKey = "19042303a8374f67ae3fe1e25c97936f";
-        private const string Ver = "4";
-        private const string Vn = "4.100.5.11121504";
-
-        /// <summary>设备标识。官方 App 会用真实网卡 MAC，这里用固定的合法测试值。</summary>
-        private const string DeviceMac = "9658dd1eafa73a55";
-        private const string DeviceSn = "0000037bb640";
-
         private const int RequestTimeoutMs = 10000;
         private const int BlockedRetryDelayMs = 3000;
 
@@ -51,17 +46,21 @@ namespace KtvDownloader.Services
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
 
-            _hostOrder = new List<string>
+            _hostOrder = new List<string>(ProtocolCredentials.Hosts);
+
+            if (_hostOrder.Count == 0)
+                throw new InvalidOperationException("源站列表为空，请检查 credentials.json 的 Hosts 配置");
+
+            _logger.Info("取址源站 " + _hostOrder.Count + " 个，首选 " + _hostOrder[0]);
+        }
+
+        /// <summary>当前源站优先级快照（诊断用）。</summary>
+        public IReadOnlyList<string> GetHostOrder()
+        {
+            lock (_orderLock)
             {
-                "http://zk.ktv1.top:6677",
-                "http://w.w345.my",
-                "http://desktok.top",
-                "http://mm.kk456.top",
-                "http://w.w345.my:66",
-                "http://z.w345.my",
-                "http://b.sktv.top",
-                "http://w345.my"
-            };
+                return new List<string>(_hostOrder);
+            }
         }
 
         public void ResetSession()
@@ -147,14 +146,14 @@ namespace KtvDownloader.Services
             }
 
             var timestamp = GetUnixTimestamp();
-            var parameters = "appid=" + AppId
-                             + "&mac=" + DeviceMac + "_" + DeviceSn
-                             + "&sn=" + DeviceSn
+            var parameters = "appid=" + ProtocolCredentials.AppId
+                             + "&mac=" + ProtocolCredentials.DeviceMac + "_" + ProtocolCredentials.DeviceSn
+                             + "&sn=" + ProtocolCredentials.DeviceSn
                              + "&time=" + timestamp
-                             + "&ver=" + Ver
-                             + "&vn=" + Vn;
+                             + "&ver=" + ProtocolCredentials.Ver
+                             + "&vn=" + ProtocolCredentials.Vn;
 
-            var sign = Md5Hex(parameters + AppKey);
+            var sign = Md5Hex(parameters + ProtocolCredentials.AppKey);
             var url = host + "/i.php?" + parameters + "&sign=" + sign;
 
             var response = await _httpClient.GetAsync(url, RequestTimeoutMs, cancellationToken)
@@ -162,10 +161,10 @@ namespace KtvDownloader.Services
 
             if (!response.IsSuccess) return null;
 
-            var code = ReadJsonInt(response.Body, "code");
+            var code = MiniJson.ReadInt(response.Body, "code");
             if (code != 200) return null;
 
-            var token = ReadJsonString(response.Body, "token");
+            var token = MiniJson.ReadString(response.Body, "token");
             if (string.IsNullOrEmpty(token)) return null;
 
             lock (_orderLock)
@@ -206,17 +205,17 @@ namespace KtvDownloader.Services
             var timestamp = GetUnixTimestamp();
 
             // 参数顺序、原始 token 中的 "=" 以及签名拼接必须与官方一致。
-            var parameters = "appid=" + AppId
-                             + "&device=" + DeviceMac + "_" + DeviceSn
+            var parameters = "appid=" + ProtocolCredentials.AppId
+                             + "&device=" + ProtocolCredentials.DeviceMac + "_" + ProtocolCredentials.DeviceSn
                              + "&ish265=" + (preferH265 ? "1" : "0")
                              + "&ls=1"
                              + "&musicno=" + musicNo
                              + "&resolution=" + (string.IsNullOrWhiteSpace(resolution) ? "720" : resolution)
-                             + "&sn=" + DeviceSn
+                             + "&sn=" + ProtocolCredentials.DeviceSn
                              + "&time=" + timestamp
                              + "&token=" + token;
 
-            var sign = Md5Hex(parameters + SdkKey);
+            var sign = Md5Hex(parameters + ProtocolCredentials.SdkKey);
             var url = host + "/music/do.php?" + parameters + "&sign=" + sign;
 
             var response = await _httpClient.GetAsync(url, RequestTimeoutMs, cancellationToken)
@@ -230,10 +229,10 @@ namespace KtvDownloader.Services
 
             if (!response.IsSuccess) return null;
 
-            var code = ReadJsonInt(response.Body, "code");
+            var code = MiniJson.ReadInt(response.Body, "code");
             if (code != 200) return null;
 
-            var data = ReadJsonString(response.Body, "data");
+            var data = MiniJson.ReadString(response.Body, "data");
             if (string.IsNullOrEmpty(data)) return null;
 
             if (!data.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
@@ -290,90 +289,6 @@ namespace KtvDownloader.Services
                 foreach (var b in bytes) builder.Append(b.ToString("x2", CultureInfo.InvariantCulture));
                 return builder.ToString();
             }
-        }
-
-        /// <summary>从响应体里读字符串字段。容忍 JSON 前面混入的 HTML 警告。</summary>
-        private static string ReadJsonString(string body, string key)
-        {
-            if (string.IsNullOrEmpty(body)) return null;
-
-            var pattern = "\"" + key + "\"";
-            var index = body.IndexOf(pattern, StringComparison.Ordinal);
-            if (index < 0) return null;
-
-            var colon = body.IndexOf(':', index + pattern.Length);
-            if (colon < 0) return null;
-
-            var i = colon + 1;
-            while (i < body.Length && char.IsWhiteSpace(body[i])) i++;
-            if (i >= body.Length || body[i] != '"') return null;
-
-            i++;
-            var builder = new StringBuilder();
-            while (i < body.Length)
-            {
-                var c = body[i++];
-                if (c == '\\')
-                {
-                    if (i >= body.Length) break;
-                    var esc = body[i++];
-                    switch (esc)
-                    {
-                        case 'n': builder.Append('\n'); break;
-                        case 'r': builder.Append('\r'); break;
-                        case 't': builder.Append('\t'); break;
-                        case '/': builder.Append('/'); break;
-                        case '"': builder.Append('"'); break;
-                        case '\\': builder.Append('\\'); break;
-                        case 'u':
-                            if (i + 4 <= body.Length)
-                            {
-                                int code;
-                                if (int.TryParse(body.Substring(i, 4), NumberStyles.HexNumber,
-                                    CultureInfo.InvariantCulture, out code))
-                                {
-                                    builder.Append((char)code);
-                                    i += 4;
-                                }
-                            }
-                            break;
-                        default: builder.Append(esc); break;
-                    }
-                    continue;
-                }
-
-                if (c == '"') break;
-                builder.Append(c);
-            }
-
-            return builder.ToString();
-        }
-
-        private static int ReadJsonInt(string body, string key)
-        {
-            if (string.IsNullOrEmpty(body)) return 0;
-
-            var pattern = "\"" + key + "\"";
-            var index = body.IndexOf(pattern, StringComparison.Ordinal);
-            if (index < 0) return 0;
-
-            var colon = body.IndexOf(':', index + pattern.Length);
-            if (colon < 0) return 0;
-
-            var i = colon + 1;
-            while (i < body.Length && char.IsWhiteSpace(body[i])) i++;
-
-            var start = i;
-            if (i < body.Length && (body[i] == '-' || char.IsDigit(body[i]))) i++;
-            while (i < body.Length && char.IsDigit(body[i])) i++;
-
-            if (i == start) return 0;
-
-            int value;
-            return int.TryParse(body.Substring(start, i - start), NumberStyles.Integer,
-                CultureInfo.InvariantCulture, out value)
-                ? value
-                : 0;
         }
 
         #endregion

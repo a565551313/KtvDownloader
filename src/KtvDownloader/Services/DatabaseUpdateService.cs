@@ -1,4 +1,5 @@
 using System;
+using System.Data.SQLite;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
@@ -8,6 +9,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using KtvDownloader.Infrastructure.Config;
 using KtvDownloader.Infrastructure.Http;
 using KtvDownloader.Infrastructure.Logging;
 using KtvDownloader.Infrastructure.Security;
@@ -17,32 +19,31 @@ namespace KtvDownloader.Services
 {
     /// <summary>
     /// 曲库更新服务。复刻官方 Muse 曲库同步协议。
+    /// <para>
+    /// 端点、设备号、RSA 公钥都在 <see cref="ProtocolCredentials"/>，
+    /// 可用 <c>%AppData%\KtvDownloader\credentials.json</c> 覆盖。
+    /// </para>
+    /// <para>
+    /// 磁盘占用要心里有数：下载的 .gz 约 418MB，解压出的 muse.db 约 983MB，
+    /// 安装时旧库还会被改名保留为 <c>muse.db.backup</c>（约 983MB），
+    /// 加上正式文件，峰值需要约 3GB 空闲空间。<see cref="UpdateAsync"/> 会先检查。
+    /// </para>
     /// </summary>
-    public sealed class DatabaseUpdateService : IDatabaseUpdateService
+    public sealed class DatabaseUpdateService : IDatabaseUpdateService, IDisposable
     {
-        private const string LoginUrl = "https://mconn.cherryonline.cn/mls-api/v1/login";
-        private const string SyncUrl = "https://mconn.cherryonline.cn/mls-api/v1/sqlite/sync";
+        /// <summary>同步接口里代表"曲库文件"的类型号。</summary>
         private const int MusicFileType = 214;
-        private const string Channel = "common";
-        private const string Mode = "ott";
-        private const string SpoofedIp = "172.16.32.15";
 
-        /// <summary>官方曲库服务认可的设备标识。</summary>
-        private const string DeviceId = "s00e04b021b2d";
-
-        /// <summary>曲库登录用的 RSA 公钥（X.509 SPKI, Base64）。</summary>
-        private const string RsaPublicKey =
-            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAucL0oFErd7REM6TSNa3EZdN1YaOs4J1eCybLPyoQ" +
-            "9ru3q1HU67agC9FzhrCG/RvAQUya5iPmQ8Caed05vqcCVcyJChmkSOGQ7DVShe2rGuTMNlpoRV6UzfcraaVS++7m2K/" +
-            "+kSZJ8OAhhhVuqPruMjsFYpdtstAwvyZT28b+eENwzpp9UHqsooZc7FZ0H8kTbs6XMkw4nIWo+4HoPAhNLEY+xdHvwY" +
-            "6drF/3WDTvsaoMrs73TVQCEEHzZNIz2H/is9VLMnIyOfnfcJi9br78Fj2xHzxu3sAySBOTVLmUMxqYh/g1ox5OXGcW9" +
-            "3HJkQLkBi42tFAEkWYlYyl93+jbbQIDAQAB";
+        /// <summary>更新所需的最小空闲空间（约 3GB，见类注释）。</summary>
+        private const long MinimumFreeBytes = 3L * 1024 * 1024 * 1024;
 
         private const string VersionFileName = "db_version.txt";
-        private const string UserAgent = "MaidongKTV/1.2";
 
         private readonly ILogger _logger;
         private readonly HttpClient _httpClient;
+
+        /// <summary>0 = 未释放，1 = 已释放。</summary>
+        private int _disposed;
 
         public DatabaseUpdateService(ILogger logger)
         {
@@ -137,8 +138,14 @@ namespace KtvDownloader.Services
 
             if (!Directory.Exists(targetDirectory)) Directory.CreateDirectory(targetDirectory);
 
+            EnsureFreeDiskSpace(targetDirectory);
+
             var gzPath = targetFullPath + ".gz.download";
             var dbPath = targetFullPath + ".db.download";
+
+            // 上次失败留下的半成品会白白占掉 1GB，先清掉。
+            SafeDelete(gzPath);
+            SafeDelete(dbPath);
 
             try
             {
@@ -159,6 +166,14 @@ namespace KtvDownloader.Services
 
                 await Task.Run(() => DecompressGzip(gzPath, dbPath, progress, cancellationToken),
                     cancellationToken).ConfigureAwait(false);
+
+                cancellationToken.ThrowIfCancellationRequested();
+                Report(progress, "正在校验曲库可用性");
+
+                // MD5 对得上只能说明"下载完整"，不能说明"这是一个能用的 SQLite 曲库"。
+                // 装上去再发现打不开，用户的旧曲库已经被改名备份了，体验极差 ——
+                // 所以在替换正式文件之前先真打开一次。
+                VerifySqliteDatabase(dbPath);
 
                 cancellationToken.ThrowIfCancellationRequested();
                 Report(progress, "正在安装曲库");
@@ -185,24 +200,24 @@ namespace KtvDownloader.Services
             try
             {
                 var encrypted = RsaPkcs1Encryptor.EncryptToBase64(
-                    RsaPublicKey,
-                    "{\"device_id\":\"" + DeviceId + "\"}");
+                    ProtocolCredentials.RsaPublicKey,
+                    "{\"device_id\":\"" + ProtocolCredentials.DatabaseDeviceId + "\"}");
 
                 var body = "{"
-                    + "\"encrypted_data\":" + QuoteJson(encrypted) + ","
-                    + "\"ip\":\"" + SpoofedIp + "\","
+                    + "\"encrypted_data\":" + MiniJson.Quote(encrypted) + ","
+                    + "\"ip\":\"" + ProtocolCredentials.SpoofedIp + "\","
                     + "\"dns\":\"\","
                     + "\"router\":\"\","
                     + "\"subnet_mask\":\"255.255.255.0\","
-                    + "\"channel\":\"" + Channel + "\","
-                    + "\"mode\":\"" + Mode + "\""
+                    + "\"channel\":\"" + ProtocolCredentials.Channel + "\","
+                    + "\"mode\":\"" + ProtocolCredentials.Mode + "\""
                     + "}";
 
-                using (var request = new HttpRequestMessage(HttpMethod.Post, LoginUrl))
+                using (var request = new HttpRequestMessage(HttpMethod.Post, ProtocolCredentials.LoginUrl))
                 {
                     request.Content = new StringContent(body, Encoding.UTF8, "application/json");
                     request.Headers.TryAddWithoutValidation("Accept", "*/*");
-                    request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
+                    request.Headers.TryAddWithoutValidation("User-Agent", ProtocolCredentials.UserAgent);
 
                     using (var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false))
                     {
@@ -250,11 +265,11 @@ namespace KtvDownloader.Services
                 var body = "{\"last_sync_at\":0,\"music_file_type\":" +
                            MusicFileType.ToString(CultureInfo.InvariantCulture) + "}";
 
-                using (var request = new HttpRequestMessage(HttpMethod.Post, SyncUrl))
+                using (var request = new HttpRequestMessage(HttpMethod.Post, ProtocolCredentials.SyncUrl))
                 {
                     request.Content = new StringContent(body, Encoding.UTF8, "application/json");
                     request.Headers.TryAddWithoutValidation("Accept", "*/*");
-                    request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
+                    request.Headers.TryAddWithoutValidation("User-Agent", ProtocolCredentials.UserAgent);
                     request.Headers.TryAddWithoutValidation("Cookie", cookie);
 
                     using (var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false))
@@ -305,21 +320,21 @@ namespace KtvDownloader.Services
 
             var info = new RemoteFileInfo
             {
-                Url = ReadJsonString(fileJson, "url"),
-                Md5 = ReadJsonString(fileJson, "md5")
+                Url = MiniJson.ReadString(fileJson, "url"),
+                Md5 = MiniJson.ReadString(fileJson, "md5")
             };
 
             // 版本优先取 date（毫秒时间戳），其次 day，再次 db_vc。
-            var date = ReadJsonRaw(fileJson, "date");
+            var date = MiniJson.ReadRaw(fileJson, "date");
             if (!string.IsNullOrEmpty(date) && date != "null")
             {
                 info.Version = date;
             }
             else
             {
-                var day = ReadJsonString(fileJson, "day");
+                var day = MiniJson.ReadString(fileJson, "day");
                 if (!string.IsNullOrEmpty(day)) info.Version = day;
-                else info.Version = ReadJsonRaw(fileJson, "db_vc");
+                else info.Version = MiniJson.ReadRaw(fileJson, "db_vc");
             }
 
             if (string.IsNullOrWhiteSpace(info.Url)) return null;
@@ -351,59 +366,6 @@ namespace KtvDownloader.Services
             return -1;
         }
 
-        private static string ReadJsonString(string json, string key)
-        {
-            var value = ReadJsonRaw(json, key);
-            if (value == null) return null;
-            if (value.Length >= 2 && value[0] == '"' && value[value.Length - 1] == '"')
-                return value.Substring(1, value.Length - 2);
-            return null;
-        }
-
-        private static string ReadJsonRaw(string json, string key)
-        {
-            var pattern = "\"" + key + "\"";
-            var index = json.IndexOf(pattern, StringComparison.Ordinal);
-            if (index < 0) return null;
-
-            var colon = json.IndexOf(':', index + pattern.Length);
-            if (colon < 0) return null;
-
-            var i = colon + 1;
-            while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
-            if (i >= json.Length) return null;
-
-            if (json[i] == '"')
-            {
-                var start = i;
-                i++;
-                while (i < json.Length)
-                {
-                    if (json[i] == '\\') { i += 2; continue; }
-                    if (json[i] == '"') { i++; break; }
-                    i++;
-                }
-                return json.Substring(start, i - start);
-            }
-
-            var valueStart = i;
-            while (i < json.Length && json[i] != ',' && json[i] != '}') i++;
-            return json.Substring(valueStart, i - valueStart).Trim();
-        }
-
-        private static string QuoteJson(string value)
-        {
-            var builder = new StringBuilder(value.Length + 2);
-            builder.Append('"');
-            foreach (var c in value)
-            {
-                if (c == '"' || c == '\\') builder.Append('\\');
-                builder.Append(c);
-            }
-            builder.Append('"');
-            return builder.ToString();
-        }
-
         #endregion
 
         #region 下载与文件处理
@@ -417,7 +379,7 @@ namespace KtvDownloader.Services
             using (var request = new HttpRequestMessage(HttpMethod.Get, url))
             {
                 request.Headers.TryAddWithoutValidation("Accept", "*/*");
-                request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
+                request.Headers.TryAddWithoutValidation("User-Agent", ProtocolCredentials.UserAgent);
 
                 using (var response = await _httpClient.SendAsync(
                     request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false))
@@ -497,6 +459,85 @@ namespace KtvDownloader.Services
             }
         }
 
+        /// <summary>
+        /// 检查目标磁盘的剩余空间，不够就直接失败，别下到一半才报"磁盘已满"。
+        /// </summary>
+        private static void EnsureFreeDiskSpace(string directory)
+        {
+            try
+            {
+                var root = Path.GetPathRoot(Path.GetFullPath(directory));
+                if (string.IsNullOrEmpty(root)) return;
+
+                var free = new DriveInfo(root).AvailableFreeSpace;
+                if (free < MinimumFreeBytes)
+                {
+                    throw new InvalidOperationException(string.Format(
+                        "磁盘空间不足：{0} 只剩 {1:F1}GB，曲库更新峰值需要约 {2:F1}GB" +
+                        "（下载包 + 解压出的曲库 + 旧曲库备份）。",
+                        root, free / (1024d * 1024 * 1024), MinimumFreeBytes / (1024d * 1024 * 1024)));
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                // 拿不到磁盘信息（网络路径等）就不拦，让后续步骤自己报错。
+            }
+        }
+
+        /// <summary>
+        /// 真打开一次解压出来的曲库：跑 <c>PRAGMA quick_check</c> 并数一下 songs 行数。
+        /// 结果不是 ok、或者一首歌都没有，都视为"这不是可用曲库"而拒绝安装。
+        /// </summary>
+        private void VerifySqliteDatabase(string databasePath)
+        {
+            var builder = new SQLiteConnectionStringBuilder
+            {
+                DataSource = databasePath,
+                ReadOnly = true,
+                FailIfMissing = true,
+                Pooling = false
+            };
+
+            using (var connection = new SQLiteConnection(builder.ToString()))
+            {
+                connection.Open();
+
+                string checkResult;
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = "PRAGMA quick_check";
+                    command.CommandTimeout = 600;
+                    checkResult = Convert.ToString(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+                }
+
+                if (!string.Equals(checkResult, "ok", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.Error("解压出的曲库未通过 quick_check: " + checkResult);
+                    throw new InvalidOperationException("下载的文件不是完好的 SQLite 曲库（quick_check=" +
+                                                        checkResult + "）");
+                }
+
+                long songCount;
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = "SELECT COUNT(*) FROM songs";
+                    command.CommandTimeout = 300;
+                    songCount = Convert.ToInt64(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+                }
+
+                if (songCount <= 0)
+                {
+                    throw new InvalidOperationException("曲库校验通过但 songs 表为空，拒绝安装");
+                }
+
+                _logger.Info("新曲库校验通过，songs 行数=" + songCount);
+            }
+        }
+
         private void InstallDatabase(string targetPath, string newDatabasePath)
         {
             var backupPath = targetPath + ".backup";
@@ -506,7 +547,8 @@ namespace KtvDownloader.Services
             if (File.Exists(targetPath))
             {
                 File.Move(targetPath, backupPath);
-                _logger.Info("旧曲库已备份到 " + backupPath);
+                _logger.Info("旧曲库已备份到 " + backupPath +
+                             "（约 1GB，确认新曲库可用后可以手动删除以回收空间）");
             }
 
             try
@@ -553,6 +595,19 @@ namespace KtvDownloader.Services
                 foreach (var b in hash) builder.Append(b.ToString("X2", CultureInfo.InvariantCulture));
                 return builder.ToString();
             }
+        }
+
+        /// <summary>
+        /// 释放内部 HttpClient。
+        /// <para>
+        /// 主界面每次保存设置 / 更新曲库都会重建服务，不释放就会累积连接池与 socket。
+        /// </para>
+        /// </summary>
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+            try { _httpClient.Dispose(); } catch { }
         }
 
         private static void SafeDelete(string path)

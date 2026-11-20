@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -56,9 +57,6 @@ namespace KtvDownloader.Forms
         /// <summary>后台预加载的完整结果缓存。翻页时直接从这里取。</summary>
         private List<Song> _prefetchCache;
 
-        /// <summary>后台预加载的取消令牌。</summary>
-        private CancellationTokenSource _prefetchCts;
-
         /// <summary>收藏存储。</summary>
         private FavoriteStore _favoriteStore;
 
@@ -74,42 +72,120 @@ namespace KtvDownloader.Forms
 
             InitializeComponent();
 
-            _configStore = new ConfigStore();
+            _configStore = new ConfigStore(null, _logger);
             _config = _configStore.Load();
+
+            // 配置文件里可以直接调日志级别。
+            ApplyLogLevel();
+
+            _favoriteStore = new FavoriteStore();
 
             InitializeServices();
         }
 
         /// <summary>
-        /// 创建所有服务实例。曲库路径在这里自动探测。
+        /// 创建所有服务实例（**只在启动时调用一次**）。曲库路径在这里自动探测。
+        /// <para>
+        /// ⚠️ 保存设置、更新曲库都不要再调这个方法：它会 Dispose 掉
+        /// <see cref="DownloadQueue"/>，而队列的 Dispose 是 CancelAll ——
+        /// 用户只是改了个下载目录，正在跑的十几首歌就全被取消了。
+        /// 那两个场景分别用 <see cref="ApplyConfigurationChanges"/> 与
+        /// <see cref="RebuildDatabaseServices"/>。
+        /// </para>
         /// </summary>
         private void InitializeServices()
         {
-            var databasePath = DatabasePathResolver.Resolve(_config.DatabasePath);
-            if (databasePath != null && databasePath != _config.DatabasePath)
-            {
-                // 自动探测到了曲库，顺手写回配置，下次启动就不用再找。
-                _config.DatabasePath = databasePath;
-                _configStore.Save(_config);
-                _logger.Info("自动探测到曲库: " + databasePath);
-            }
+            var databasePath = ResolveAndPersistDatabasePath();
 
-            DisposeServices();
-
-            _searchService = new SongSearchService(_logger, databasePath);
-            _playlistService = new PlaylistService(_logger, databasePath);
-            _urlService = new SongUrlService(_logger, new CleanHttpClient(_logger));
+            var urlClient = new CleanHttpClient(_logger);
+            _urlService = new SongUrlService(_logger, urlClient);
             _decryptService = new TsDecryptService(_logger);
             _mediaService = new MediaService(_logger, _config.FfmpegPath);
             _downloadService = new DownloadService(_logger, _urlService, _decryptService, _mediaService);
             _downloadQueue = new DownloadQueue(_logger, _downloadService, _config.MaxConcurrency);
             _databaseUpdateService = new DatabaseUpdateService(_logger);
-            _favoriteStore = _favoriteStore ?? new FavoriteStore();
-            _previewService = new PreviewService(_logger, _urlService, _decryptService, _mediaService);
+
+            _searchService = new SongSearchService(_logger, databasePath);
+            _playlistService = new PlaylistService(_logger, databasePath);
+
+            // 预览走 libVLC 直接播解密后的 TS，不再需要 MediaService。
+            _previewService = new PreviewService(_logger, _urlService, _decryptService);
 
             _downloadQueue.TaskUpdated += OnDownloadTaskUpdated;
         }
 
+        /// <summary>
+        /// 探测曲库文件，探到了就写回配置（下次启动不用再找）。
+        /// </summary>
+        private string ResolveAndPersistDatabasePath()
+        {
+            var databasePath = DatabasePathResolver.Resolve(_config.DatabasePath);
+            if (databasePath != null && databasePath != _config.DatabasePath)
+            {
+                _config.DatabasePath = databasePath;
+                _configStore.Save(_config);
+                _logger.Info("自动探测到曲库: " + databasePath);
+            }
+            return databasePath;
+        }
+
+        /// <summary>
+        /// 只重建「曲库相关」的服务：搜索与歌单。
+        /// <para>
+        /// 这两个服务不参与下载管线，重建它们不会碰到正在跑的任务 ——
+        /// 曲库更新完成后、或者用户在设置里换了曲库路径，都用这条路径。
+        /// </para>
+        /// </summary>
+        private void RebuildDatabaseServices()
+        {
+            var databasePath = ResolveAndPersistDatabasePath();
+
+            if (_searchService != null)
+            {
+                _searchService.Dispose();
+                _searchService = null;
+            }
+
+            _searchService = new SongSearchService(_logger, databasePath);
+            _playlistService = new PlaylistService(_logger, databasePath);
+
+            // 换了曲库，旧结果与新曲库对不上，直接清掉，别让用户翻到一半发现歌号不存在。
+            _prefetchCache = null;
+        }
+
+        /// <summary>
+        /// 设置保存后**原地**应用变更，不重建下载管线。
+        /// </summary>
+        /// <param name="oldDatabasePath">保存前的曲库路径，用于判断是否真的变了。</param>
+        private void ApplyConfigurationChanges(string oldDatabasePath)
+        {
+            // 1) 并发数：队列支持热调整（内部换一个信号量，在跑的任务不受影响）。
+            if (_downloadQueue != null) _downloadQueue.SetMaxConcurrency(_config.MaxConcurrency);
+
+            // 2) ffmpeg 路径：原地更新，下一次调用重新解析。
+            if (_mediaService != null) _mediaService.UpdateFfmpegPath(_config.FfmpegPath);
+
+            // 3) 日志级别。
+            ApplyLogLevel();
+
+            // 4) 曲库路径变了才重建搜索/歌单服务。
+            if (!string.Equals(oldDatabasePath, _config.DatabasePath, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.Info("曲库路径变更，重建搜索服务: " + _config.DatabasePath);
+                RebuildDatabaseServices();
+            }
+        }
+
+        private void ApplyLogLevel()
+        {
+            var fileLogger = _logger as FileLogger;
+            if (fileLogger == null) return;
+            fileLogger.MinimumLevel = LogLevelParser.Parse(_config.LogLevel, LogLevel.Debug);
+        }
+
+        /// <summary>
+        /// 释放全部服务。**只在窗体关闭时调用**。
+        /// </summary>
         private void DisposeServices()
         {
             if (_downloadQueue != null)
@@ -119,11 +195,28 @@ namespace KtvDownloader.Forms
                 _downloadQueue = null;
             }
 
-            if (_searchService != null)
-            {
-                _searchService.Dispose();
-                _searchService = null;
-            }
+            // 下载服务与预览服务各自持有 HttpClient，不释放会累积连接池与 socket。
+            DisposeQuietly(ref _downloadService);
+            DisposeQuietly(ref _previewService);
+            DisposeQuietly(ref _databaseUpdateService);
+            DisposeQuietly(ref _searchService);
+
+            _playlistService = null;
+            _urlService = null;
+            _decryptService = null;
+            _mediaService = null;
+        }
+
+        /// <summary>
+        /// 释放并置空。关闭阶段的异常没有意义，吞掉即可，
+        /// 但一定要继续释放后面的对象 —— 所以每个都单独 try。
+        /// </summary>
+        private void DisposeQuietly<T>(ref T service) where T : class, IDisposable
+        {
+            if (service == null) return;
+            try { service.Dispose(); }
+            catch (Exception ex) { _logger.Warn("释放 " + typeof(T).Name + " 失败: " + ex.Message); }
+            service = null;
         }
 
         /// <summary>
@@ -394,7 +487,7 @@ namespace KtvDownloader.Forms
             Func<int, int, CancellationToken, Task<IReadOnlyList<Song>>> fetch,
             Func<CancellationToken, Task<int>> countFetcher)
         {
-            if (!_searchService.IsAvailable)
+            if (!await IsDatabaseReadyAsync())
             {
                 MessageBox.Show("曲库未就绪，无法浏览。", "KtvDownloader",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -464,7 +557,7 @@ namespace KtvDownloader.Forms
                 return;
             }
 
-            if (!_searchService.IsAvailable)
+            if (!await IsDatabaseReadyAsync())
             {
                 MessageBox.Show("曲库未就绪，无法搜索。", "KtvDownloader",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -479,21 +572,27 @@ namespace KtvDownloader.Forms
             // 用曲库校验歌手名，避免把普通带空格的歌名误判为组合搜索。
             if (!_lastSearchBySinger)
             {
+                var searchService = _searchService;
                 var singerCheck = new Func<string, bool>(name =>
                 {
                     try
                     {
-                        return _searchService.SingerExistsAsync(name)
+                        // 这里已经是后台线程，同步等待是安全的（见下面的 Task.Run）。
+                        return searchService.SingerExistsAsync(name)
                             .GetAwaiter().GetResult();
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        _logger.Warn("校验歌手名失败: " + ex.Message);
                         return false;
                     }
                 });
 
-                _lastQuery = SearchQuery.Resolve(keyword, singerCheck);
-                _lastIsCombined = _lastQuery.IsCombined;
+                // ⚠️ Resolve 内部会对每个候选切法调一次 singerCheck，
+                // 而每次 singerCheck 都是一趟 SQLite 查询。三段以上的输入要查好几轮，
+                // 直接在 UI 线程上跑就是肉眼可见的卡顿（按下回车后要等一下才出结果）。
+                _lastQuery = await Task.Run(() => SearchQuery.Resolve(keyword, singerCheck));
+                _lastIsCombined = _lastQuery != null && _lastQuery.IsCombined;
 
                 if (_lastIsCombined)
                 {
@@ -607,16 +706,23 @@ namespace KtvDownloader.Forms
             var language = _lastLanguage;
             var bySinger = _lastSearchBySinger;
 
+            // ⚠️ 组合搜索的歌名/歌手也必须在这里快照下来。
+            // 后台任务跑几秒到几十秒，期间用户完全可以再搜一次；
+            // 直接读 _lastQuery 字段就会拿着**新**的查询条件去补**旧**的结果，
+            // 最后把两份不相干的结果混进同一个缓存。
+            var isCombined = _lastIsCombined && _lastQuery != null;
+            var songName = isCombined ? _lastQuery.SongName : string.Empty;
+            var singerName = isCombined ? _lastQuery.SingerName : string.Empty;
+
             Task.Run(async () =>
             {
                 try
                 {
                     // 统计总数（组合搜索用专门的计数方法）
                     int total;
-                    if (_lastIsCombined && _lastQuery != null)
+                    if (isCombined)
                     {
-                        total = await _searchService.CountCombinedAsync(
-                            _lastQuery.SongName, _lastQuery.SingerName, token);
+                        total = await _searchService.CountCombinedAsync(songName, singerName, token);
                     }
                     else
                     {
@@ -651,7 +757,7 @@ namespace KtvDownloader.Forms
                     });
 
                     IReadOnlyList<Song> all;
-                    if (_lastIsCombined && _lastQuery != null)
+                    if (isCombined)
                     {
                         // 组合搜索：分页循环拉取。
                         var buffer = new List<Song>();
@@ -661,7 +767,7 @@ namespace KtvDownloader.Forms
                             if (token.IsCancellationRequested) return;
 
                             var page = await _searchService.SearchCombinedAsync(
-                                _lastQuery.SongName, _lastQuery.SingerName,
+                                songName, singerName,
                                 buffer.Count, batch, fastOnly: false, cancellationToken: token);
 
                             if (page.Count == 0) break;
@@ -684,6 +790,10 @@ namespace KtvDownloader.Forms
                     BeginInvoke(new Action(() =>
                     {
                         if (IsDisposed) return;
+                        // token 已经作废（用户又搜了一次）就别再动界面，
+                        // 否则新搜索刚显示的第一页会被旧缓存覆盖掉。
+                        if (token.IsCancellationRequested) return;
+
                         lblPrefetchStatus.Text = string.Format("已缓存 {0} 条", all.Count);
                         lblPrefetchStatus.Visible = true;
 
@@ -703,98 +813,50 @@ namespace KtvDownloader.Forms
         }
 
         /// <summary>
-        /// 后台把全部搜索结果预加载进缓存。
-        /// 不阻塞界面，用户翻页时直接从缓存取，无需再查库。
+        /// 取消后台预加载并丢弃缓存。
+        /// <para>
+        /// ⚠️ 早期版本取消的是一个叫 <c>_prefetchCts</c> 的字段，而它**从来没有被赋过值**
+        /// （真正在用的是 <see cref="_searchCts"/>），所以这个"取消"一直是空操作：
+        /// 用户连着搜两次，第一次的后台预取还在往 <c>_prefetchCache</c> / <c>_lastQuery</c> 里写，
+        /// 翻页时就会看到上一次搜索的结果混进来。
+        /// </para>
         /// </summary>
-        private void StartBackgroundPrefetch(CancellationToken token)
-        {
-            var keyword = _lastKeyword;
-            var language = _lastLanguage;
-            var bySinger = _lastSearchBySinger;
-
-            // 已经全部加载完就不必再预取。
-            if (_searchResults.Count >= paginationBar.TotalPages * paginationBar.PageSize)
-                return;
-
-            Task.Run(async () =>
-            {
-                try
-                {
-                    var progress = new Progress<int>(count =>
-                    {
-                        if (IsDisposed || !IsHandleCreated) return;
-                        try
-                        {
-                            BeginInvoke(new Action(() =>
-                            {
-                                if (IsDisposed) return;
-                                lblPrefetchStatus.Text = string.Format("后台加载中... {0} 条", count);
-                                lblPrefetchStatus.Visible = true;
-                            }));
-                        }
-                        catch (InvalidOperationException) { }
-                    });
-
-                    IReadOnlyList<Song> all;
-                    if (_lastIsCombined && _lastQuery != null)
-                    {
-                        // 组合搜索：分页循环拉取。
-                        var buffer = new List<Song>();
-                        const int batch = 500;
-                        while (buffer.Count < 5000)
-                        {
-                            if (token.IsCancellationRequested) return;
-
-                            var page = await _searchService.SearchCombinedAsync(
-                                _lastQuery.SongName, _lastQuery.SingerName,
-                                buffer.Count, batch, fastOnly: false, cancellationToken: token);
-
-                            if (page.Count == 0) break;
-                            buffer.AddRange(page);
-                            if (progress != null) ((IProgress<int>)progress).Report(buffer.Count);
-                            if (page.Count < batch) break;
-                        }
-                        all = buffer;
-                    }
-                    else
-                    {
-                        all = await _searchService.GetAllMatchesAsync(
-                            keyword, language, bySinger, 5000, progress, token);
-                    }
-
-                    if (token.IsCancellationRequested || IsDisposed) return;
-
-                    // 写回缓存供翻页使用。
-                    _prefetchCache = new List<Song>(all);
-
-                    if (!IsHandleCreated) return;
-                    BeginInvoke(new Action(() =>
-                    {
-                        if (IsDisposed) return;
-                        lblPrefetchStatus.Text = string.Format("已缓存全部 {0} 条", all.Count);
-                        lblPrefetchStatus.Visible = true;
-                        _logger.Info(string.Format("后台预加载完成，共 {0} 条", all.Count));
-                    }));
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex)
-                {
-                    _logger.Warn("后台预加载失败: " + ex.Message);
-                }
-            }, token);
-        }
-
-        /// <summary>取消后台预加载。</summary>
         private void CancelBackgroundLoad()
         {
-            if (_prefetchCts != null)
+            var cts = _searchCts;
+            _searchCts = null;
+
+            if (cts != null)
             {
-                try { _prefetchCts.Cancel(); _prefetchCts.Dispose(); } catch { }
-                _prefetchCts = null;
+                try { cts.Cancel(); } catch (ObjectDisposedException) { }
+                catch (Exception ex) { _logger.Warn("取消后台加载失败: " + ex.Message); }
+
+                // Cancel 之后后台任务可能还在收尾，Dispose 交给它结束后的竞态处理：
+                // 这里立刻 Dispose 会让仍在 await 的分支抛 ObjectDisposedException。
+                // 用一个延迟释放，既不漏句柄也不打断收尾。
+                DisposeLater(cts);
             }
+
             _prefetchCache = null;
 
             if (!IsDisposed) lblPrefetchStatus.Visible = false;
+        }
+
+        /// <summary>
+        /// 延迟释放一个 CancellationTokenSource。
+        /// <para>
+        /// <c>Cancel()</c> 之后，注册在 token 上的回调与正在 await 的分支还需要一点时间收尾，
+        /// 立刻 <c>Dispose()</c> 会让它们撞上 <see cref="ObjectDisposedException"/>。
+        /// 丢到线程池上等一会儿再释放，既不泄漏句柄也不打断收尾。
+        /// </para>
+        /// </summary>
+        private void DisposeLater(CancellationTokenSource cts)
+        {
+            Task.Run(async () =>
+            {
+                try { await Task.Delay(2000).ConfigureAwait(false); } catch { }
+                try { cts.Dispose(); } catch { }
+            });
         }
 
         /// <summary>翻页。</summary>
@@ -1065,30 +1127,150 @@ namespace KtvDownloader.Forms
             }
         }
 
-        /// <summary>右键菜单：预览 / 下载 / 复制歌号。</summary>
+        /// <summary>右键菜单：预览 / 下载 / 收藏 / 复制歌号。</summary>
         private void OnResultMouseUp(object sender, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Right) return;
             if (lvResults.SelectedItems.Count == 0) return;
 
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("预览", null, (s, args) => OnPreviewClick(this, EventArgs.Empty));
-            menu.Items.Add("下载", null, (s, args) => OnDownloadSelectedClick(this, EventArgs.Empty));
-            menu.Items.Add(new ToolStripSeparator());
+            // 菜单项回调里**不要**再读 lvResults.SelectedItems：
+            // 菜单是异步弹出的，用户点之前选中项可能已经变了。这里先把歌取出来。
+            var song = lvResults.SelectedItems[0].Tag as Song;
+            if (song == null) return;
 
-            var copyItem = new ToolStripMenuItem("复制歌号");
-            copyItem.Click += (s, args) =>
+            ShowContextMenu(lvResults, e.Location, menu =>
             {
-                var song = lvResults.SelectedItems[0].Tag as Song;
-                if (song != null)
+                menu.Items.Add("预览", null, (s, args) => OnPreviewClick(this, EventArgs.Empty));
+                menu.Items.Add("下载", null, (s, args) => OnDownloadSelectedClick(this, EventArgs.Empty));
+                menu.Items.Add(new ToolStripSeparator());
+
+                // 收藏：FavoriteStore 早就写好了，但一直没有入口，
+                // 「收藏」浏览模式永远是空的，状态栏还写着"可在搜索结果右键添加收藏"。
+                var isFavorite = IsFavorite(song);
+                var favoriteItem = new ToolStripMenuItem(isFavorite ? "取消收藏" : "添加收藏");
+                favoriteItem.Click += (s, args) => ToggleFavorite(song);
+                menu.Items.Add(favoriteItem);
+
+                var copyItem = new ToolStripMenuItem("复制歌号");
+                copyItem.Enabled = !string.IsNullOrEmpty(song.MusicNo);
+                copyItem.Click += (s, args) =>
                 {
                     try { Clipboard.SetText(song.MusicNo); }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        // 剪贴板可能被别的进程占着，失败就只在状态栏提一句。
+                        _logger.Warn("复制歌号失败: " + ex.Message);
+                        UpdateStatus("复制歌号失败：" + ex.Message);
+                    }
+                };
+                menu.Items.Add(copyItem);
+            });
+        }
+
+        /// <summary>
+        /// 弹出一个用完即释放的右键菜单。
+        /// <para>
+        /// ⚠️ 早期版本每次右键都 <c>new ContextMenuStrip()</c> 且从不 Dispose。
+        /// ContextMenuStrip 内部持有原生窗口句柄，右键点几百次就是几百个泄漏句柄
+        /// （任务管理器里"句柄数"一路涨，最后 GDI 对象耗尽、界面开始花屏）。
+        /// </para>
+        /// </summary>
+        private void ShowContextMenu(Control owner, Point location, Action<ContextMenuStrip> build)
+        {
+            var menu = new ContextMenuStrip();
+
+            try
+            {
+                build(menu);
+            }
+            catch (Exception ex)
+            {
+                menu.Dispose();
+                _logger.Warn("构建右键菜单失败: " + ex.Message);
+                return;
+            }
+
+            if (menu.Items.Count == 0)
+            {
+                menu.Dispose();
+                return;
+            }
+
+            menu.Closed += (s, args) =>
+            {
+                var target = menu;
+
+                // 用 BeginInvoke 让释放发生在 Closed 事件链完全结束之后，
+                // 否则 WinForms 还在用这个对象时就把它 Dispose 了。
+                if (IsDisposed || !IsHandleCreated)
+                {
+                    try { target.Dispose(); } catch { }
+                    return;
+                }
+
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        try { target.Dispose(); } catch { }
+                    }));
+                }
+                catch (InvalidOperationException)
+                {
+                    try { target.Dispose(); } catch { }
                 }
             };
-            menu.Items.Add(copyItem);
 
-            menu.Show(lvResults, e.Location);
+            menu.Show(owner, location);
+        }
+
+        private bool IsFavorite(Song song)
+        {
+            if (song == null || string.IsNullOrEmpty(song.MusicNo)) return false;
+            try { return _favoriteStore != null && _favoriteStore.Contains(song.MusicNo); }
+            catch (Exception ex)
+            {
+                _logger.Warn("读取收藏状态失败: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>添加 / 取消收藏。收藏以歌号为准，曲库更新后依然有效。</summary>
+        private void ToggleFavorite(Song song)
+        {
+            if (song == null || string.IsNullOrEmpty(song.MusicNo))
+            {
+                UpdateStatus("这首歌没有歌号，无法收藏");
+                return;
+            }
+
+            try
+            {
+                if (_favoriteStore.Contains(song.MusicNo))
+                {
+                    _favoriteStore.Remove(song.MusicNo);
+                    UpdateStatus("已取消收藏：" + song.DisplayName);
+                }
+                else
+                {
+                    _favoriteStore.Add(song.MusicNo);
+                    UpdateStatus(string.Format("已收藏：{0}（歌号 {1}）", song.DisplayName, song.MusicNo));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("收藏操作失败", ex);
+                UpdateStatus("收藏操作失败：" + ex.Message);
+                return;
+            }
+
+            // 正停在「收藏」列表上时，改动要立刻反映出来。
+            if (_browseMode == BrowseMode.Favorites)
+            {
+#pragma warning disable CS4014
+                LoadFavoritesAsync();
+#pragma warning restore CS4014
+            }
         }
 
         /// <summary>
@@ -1144,6 +1326,12 @@ namespace KtvDownloader.Forms
 
         /// <summary>
         /// 在下载目录里找这首歌已下载好的文件。
+        /// <para>
+        /// 命名规则的**唯一**权威是 <see cref="SongFileNaming"/>：
+        /// 下载落盘用它、预览探测也用它。早期这里自己又拼了一遍
+        /// <c>歌名-歌手</c>（没有歌号、没有 .mp3、后缀顺序也不同），
+        /// 于是明明下过的歌预览时找不到本地文件，白白再下一次。
+        /// </para>
         /// </summary>
         private string FindLocalFile(Song song)
         {
@@ -1151,32 +1339,14 @@ namespace KtvDownloader.Forms
             {
                 var directory = _config.OutputDirectory;
                 if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)) return null;
-
-                var baseName = string.IsNullOrEmpty(song.Singer)
-                    ? song.Name
-                    : song.Name + "-" + song.Singer;
-
-                baseName = Infrastructure.Extensions.CommonExtensions.ToSafeFileName(baseName, 100);
-
-                foreach (var extension in new[] { ".mp4", ".ts" })
-                {
-                    var candidate = Path.Combine(directory, baseName + extension);
-                    if (File.Exists(candidate)) return candidate;
-                }
-
-                // 音轨分离会产出 -原唱 / -伴奏 后缀的文件。
-                foreach (var suffix in new[] { "-伴奏", "-原唱" })
-                {
-                    var candidate = Path.Combine(directory, baseName + suffix + ".mp4");
-                    if (File.Exists(candidate)) return candidate;
-                }
+                return SongFileNaming.FindExistingFile(directory, song);
             }
-            catch
+            catch (Exception ex)
             {
-                // 探测失败按没有本地文件处理。
+                // 探测失败按没有本地文件处理，但要说清楚原因。
+                _logger.Warn("查找本地文件失败: " + ex.Message);
+                return null;
             }
-
-            return null;
         }
 
         private void OnDownloadSelectedClick(object sender, EventArgs e)
@@ -1356,8 +1526,11 @@ namespace KtvDownloader.Forms
             var task = lvQueue.SelectedItems[0].Tag as DownloadTask;
             if (task == null) return;
 
-            var menu = new ContextMenuStrip();
+            ShowContextMenu(lvQueue, e.Location, menu => BuildQueueMenu(menu, task));
+        }
 
+        private void BuildQueueMenu(ContextMenuStrip menu, DownloadTask task)
+        {
             if (task.State == DownloadState.Completed)
             {
                 menu.Items.Add("预览", null, (s, args) =>
@@ -1396,7 +1569,16 @@ namespace KtvDownloader.Forms
             };
             menu.Items.Add(cancelItem);
 
-            menu.Show(lvQueue, e.Location);
+            // 完成的歌也可以收藏，省得回搜索结果里再找一遍。
+            if (task.Song != null && !string.IsNullOrEmpty(task.Song.MusicNo))
+            {
+                menu.Items.Add(new ToolStripSeparator());
+                var isFavorite = IsFavorite(task.Song);
+                var song = task.Song;
+                var favoriteItem = new ToolStripMenuItem(isFavorite ? "取消收藏" : "添加收藏");
+                favoriteItem.Click += (s, args) => ToggleFavorite(song);
+                menu.Items.Add(favoriteItem);
+            }
         }
 
         private void OnCancelAllClick(object sender, EventArgs e)
@@ -1451,7 +1633,7 @@ namespace KtvDownloader.Forms
 
         private async void OnCheckUpdateClick(object sender, EventArgs e)
         {
-            if (!EnsureDatabaseReady()) return;
+            if (!await EnsureDatabaseReadyAsync()) return;
 
             try
             {
@@ -1536,8 +1718,9 @@ namespace KtvDownloader.Forms
                 _config.DatabasePath = resultPath;
                 _configStore.Save(_config);
 
-                // 重建服务，让新的曲库立即生效。
-                InitializeServices();
+                // 只重建曲库相关的服务，让新曲库立即生效。
+                // 更新曲库的时候完全可能有下载任务在跑，重建整套服务会把它们全部取消。
+                RebuildDatabaseServices();
                 await ReloadDatabaseAsync();
 
                 MessageBox.Show(
@@ -1582,13 +1765,45 @@ namespace KtvDownloader.Forms
             }
         }
 
-        private bool EnsureDatabaseReady()
+        /// <summary>
+        /// 曲库是否可用；不可用时提示用户。检查本身放到后台线程，理由见
+        /// <see cref="IsDatabaseReadyAsync"/>。
+        /// </summary>
+        private async Task<bool> EnsureDatabaseReadyAsync()
         {
-            if (_searchService != null && _searchService.IsAvailable) return true;
+            if (await IsDatabaseReadyAsync()) return true;
 
-            MessageBox.Show("曲库未就绪，请先配置曲库或更新曲库。", "KtvDownloader",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            if (!IsDisposed)
+            {
+                MessageBox.Show("曲库未就绪，请先配置曲库或更新曲库。", "KtvDownloader",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
             return false;
+        }
+
+        /// <summary>
+        /// 在后台线程上判断曲库是否可用。
+        /// <para>
+        /// ⚠️ <c>ISongSearchService.IsAvailable</c> 不是纯查询：它内部会
+        /// <c>TryEnsureConnection()</c>，第一次要真的打开一个近 1GB 的 SQLite 文件，
+        /// 曲库刚被更新替换过时还要重开一次。直接在 UI 线程上调就是几百毫秒的界面冻结 ——
+        /// 而且每次搜索、每次翻页都会冻一下。
+        /// </para>
+        /// </summary>
+        private Task<bool> IsDatabaseReadyAsync()
+        {
+            var service = _searchService;
+            if (service == null) return Task.FromResult(false);
+
+            return Task.Run(() =>
+            {
+                try { return service.IsAvailable; }
+                catch (Exception ex)
+                {
+                    _logger.Warn("检查曲库可用性失败: " + ex.Message);
+                    return false;
+                }
+            });
         }
 
         #endregion
@@ -1597,7 +1812,7 @@ namespace KtvDownloader.Forms
 
         private async void OnPlaylistsClick(object sender, EventArgs e)
         {
-            if (!EnsureDatabaseReady()) return;
+            if (!await EnsureDatabaseReadyAsync()) return;
 
             try
             {
@@ -1643,6 +1858,9 @@ namespace KtvDownloader.Forms
             {
                 if (form.ShowDialog(this) != DialogResult.OK) return;
 
+                // 记住改动前的值，用来判断到底哪些东西需要重建。
+                var oldDatabasePath = _config.DatabasePath;
+
                 form.ApplyTo(_config);
                 _config.Normalize();
 
@@ -1653,14 +1871,23 @@ namespace KtvDownloader.Forms
                 }
                 else
                 {
-                    _logger.Warn("配置保存失败");
-                    MessageBox.Show("设置保存失败，请检查目录权限。", "KtvDownloader",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    _logger.Warn("配置保存失败: " + _configStore.LastError);
+                    MessageBox.Show(
+                        "设置保存失败，本次改动只在这次运行里生效。" + Environment.NewLine +
+                        (_configStore.LastError ?? "请检查目录权限。"),
+                        "KtvDownloader", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
 
-                // 配置变了（曲库路径/ffmpeg/并发数），重建服务。
-                InitializeServices();
-                CheckDatabase();
+                // 配置变了，**原地**应用：并发数热调整、ffmpeg 路径热更新、
+                // 曲库路径变了才重建搜索服务。
+                // 绝不能调 InitializeServices() —— 那会 Dispose 下载队列，
+                // 而队列 Dispose 等于 CancelAll，用户只是改了个目录，正在下的歌就全没了。
+                ApplyConfigurationChanges(oldDatabasePath);
+
+                if (!string.Equals(oldDatabasePath, _config.DatabasePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    CheckDatabase();
+                }
             }
         }
 

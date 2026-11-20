@@ -10,6 +10,12 @@ namespace KtvDownloader.Services.Interfaces
     /// </summary>
     public interface IMediaService
     {
+        /// <summary>
+        /// 更新 ffmpeg 路径，下一次调用时重新解析。
+        /// 用于「设置保存后立即生效」，避免为此重建整套服务（那会取消正在下载的任务）。
+        /// </summary>
+        void UpdateFfmpegPath(string configuredFfmpegPath);
+
         /// <summary>ffmpeg 是否可用（已找到且能执行）。</summary>
         bool IsFfmpegAvailable { get; }
 
@@ -36,14 +42,21 @@ namespace KtvDownloader.Services.Interfaces
 
         /// <summary>
         /// 分离原唱 / 伴奏，产出独立文件。
-        /// 双音轨时按轨道拆；单音轨时按卡拉OK左右声道拆。
+        /// <para>
+        /// 双音轨时按轨道拆（第 1 条=原唱，第 2 条=伴奏）；
+        /// 单音轨时按老式卡拉OK的左右声道拆，此时**必须**知道
+        /// <paramref name="accomp"/>：1=左原唱右伴奏，2=左伴奏右原唱（docs §7.5）。
+        /// 忽略 accomp 会让约一半的老歌把原唱和伴奏搞反。
+        /// </para>
         /// </summary>
+        /// <param name="accomp">曲库 songs.accomp 字段，1 或 2；未知时传 0 按 1 处理。</param>
         Task<SplitResult> SplitVocalAsync(
             string sourceTs,
             string outputDirectory,
             string baseFileName,
             VocalOption option,
             int audioBitrateKbps,
+            int accomp,
             CancellationToken cancellationToken = default(CancellationToken));
     }
 

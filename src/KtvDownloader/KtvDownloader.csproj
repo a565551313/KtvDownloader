@@ -7,11 +7,34 @@
     <AssemblyName>KtvDownloader</AssemblyName>
     <RootNamespace>KtvDownloader</RootNamespace>
     <UseWindowsForms>true</UseWindowsForms>
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
     <PlatformTarget>x64</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
+
+    <!-- ── 版本号的唯一来源 ──
+         早期是 GenerateAssemblyInfo=false + Properties/AssemblyInfo.cs 里钉死 1.0.0.0，
+         于是启动日志、崩溃日志、「关于」对话框永远显示同一个版本，
+         拿到一份日志根本分不清用户跑的是哪次构建。
+         现在由 SDK 生成程序集特性，CI 可以用 -p:Version=x.y.z 直接覆盖。 -->
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
+    <AssemblyTitle>KtvDownloader</AssemblyTitle>
+    <Product>KtvDownloader</Product>
+    <Description>麦动 KTV 曲库下载器</Description>
+    <Deterministic>true</Deterministic>
+
+    <!-- 生成 XML 文档，这样 <see cref="..."/> 写错（CS1574）能在构建时被发现 ——
+         SearchQuery.cs 里就有一条指向早已不存在的方法的 cref，躺了很久没人发现。
+         同时屏蔽 CS1591（公开成员缺注释）：那会刷出几百条噪音，把真正有用的告警淹掉。 -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <!-- 把告警当告警看：构建输出里出现 warning 时 CI 会把它显示出来。
+         不用 TreatWarningsAsErrors，否则一次 NuGet 升级就可能让整个 CI 红掉。 -->
+    <WarningLevel>4</WarningLevel>
   </PropertyGroup>
 
   <ItemGroup>
@@ -24,13 +47,17 @@
     <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.21" />
   </ItemGroup>
 
-  <ItemGroup>
+  <!-- ffmpeg.exe 不在仓库里（tools/ 已被 .gitignore 忽略，体积也有 100MB+）。
+       ⚠️ 必须带 Condition：早期这里是无条件 <None Include="..\..\tools\ffmpeg.exe">，
+       新克隆的仓库里没有这个文件，MSBuild 直接报 MSB3021/MSB3030 编译不过 ——
+       而 README 的「快速开始」根本没提要自己放一个 ffmpeg 进来。
+       没有它也能跑：MediaService.FindOnPath 会退回 PATH 查找，只是转码/音轨分离不可用。 -->
+  <ItemGroup Condition="Exists('..\..\tools\ffmpeg.exe')">
     <None Include="..\..\tools\ffmpeg.exe" Link="tools\ffmpeg.exe">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
     </None>
   </ItemGroup>
-
 
   <!-- 工程锁定 x64：构建后删除 x86 的 libvlc，省约 96MB。
        NuGet 的 targets 会在 Copy 阶段强制带上 x86，只能在构建后清理。 -->

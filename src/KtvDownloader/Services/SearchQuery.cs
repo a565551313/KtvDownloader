@@ -10,7 +10,7 @@ namespace KtvDownloader.Services
     /// <list type="bullet">
     /// <item><c>发如雪 周杰伦</c> → 歌名=发如雪, 歌手=周杰伦</item>
     /// <item><c>童话</c> → 歌名=童话, 歌手=空</item>
-    /// <item><c>周杰伦 童话</c> → 顺序反过来也能识别（见 <see cref="TryParseReversed"/></item>
+    /// <item><c>周杰伦 童话</c> → 顺序反过来也能识别（见 <see cref="Resolve"/> 里的候选枚举）</item>
     /// </list>
     /// </para>
     /// <para>
@@ -87,52 +87,91 @@ namespace KtvDownloader.Services
             var simple = Parse(trimmed);
             if (!simple.IsCombined) return simple;
 
-            if (singerExists != null && singerExists(simple.SingerName))
-                return simple;
+            // 没有校验函数就没法择优，直接用「最后一个空格」的切法。
+            if (singerExists == null) return simple;
 
-            // 最后一段不是歌手名，尝试从左往右找：
-            // 例如「陈奕迅 王菲 因为爱情」→ 歌名=因为爱情, 歌手=陈奕迅 王菲
+            if (singerExists(simple.SingerName)) return simple;
+
+            // 最后一段不是歌手名，尝试别的切法：
+            // 例如「陈奕迅 王菲 因为爱情」→ 歌名=因为爱情, 歌手=陈奕迅 王菲；
+            // 又如「周杰伦 发如雪」→ 歌名=发如雪, 歌手=周杰伦（用户把顺序写反了）。
             var parts = SplitBySpace(trimmed);
             if (parts.Count < 2) return simple;
 
-            // 尝试各种切分：前 k 段当歌手，后 n-k 段当歌名（以及反过来）。
-            var candidates = new List<SearchQuery>();
-
-            for (var k = 1; k < parts.Count; k++)
-            {
-                // 前 k 段是歌名，后面是歌手
-                var songPart = string.Join(" ", parts.GetRange(0, k));
-                var singerPart = string.Join(" ", parts.GetRange(k, parts.Count - k));
-                candidates.Add(new SearchQuery
-                {
-                    Raw = trimmed,
-                    SongName = songPart,
-                    SingerName = singerPart
-                });
-
-                // 前 k 段是歌手，后面是歌名
-                var singerPart2 = string.Join(" ", parts.GetRange(0, k));
-                var songPart2 = string.Join(" ", parts.GetRange(k, parts.Count - k));
-                candidates.Add(new SearchQuery
-                {
-                    Raw = trimmed,
-                    SongName = songPart2,
-                    SingerName = singerPart2
-                });
-            }
+            var candidates = BuildCandidates(trimmed, parts, simple);
 
             // 优先选「歌手名能匹配上」的方案。
-            if (singerExists != null)
+            foreach (var candidate in candidates)
             {
-                foreach (var candidate in candidates)
-                {
-                    if (candidate.SingerName.Length > 0 && singerExists(candidate.SingerName))
-                        return candidate;
-                }
+                if (candidate.SingerName.Length > 0 && singerExists(candidate.SingerName))
+                    return candidate;
             }
 
             // 都不匹配，退回最简单的切分。
             return simple;
+        }
+
+        /// <summary>
+        /// 枚举所有可能的切分方案（去重后）。
+        /// <para>
+        /// ⚠️ 必须去重：<c>singerExists</c> 是一次**同步阻塞**的曲库查询，
+        /// 每多一个重复候选就多阻塞一次 UI 线程。
+        /// 早期版本对每个切点 k 都生成两条候选，而 k 与 parts.Count-k 会产生完全相同的组合，
+        /// 三段输入就要白跑一倍查询。
+        /// </para>
+        /// </summary>
+        private static List<SearchQuery> BuildCandidates(
+            string raw,
+            List<string> parts,
+            SearchQuery alreadyTried)
+        {
+            var candidates = new List<SearchQuery>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            // 「最后一个空格」那种切法在上面已经校验过一轮了，
+            // 而 k = parts.Count-1 时会生成一模一样的组合 —— 先占位，避免白查一次库。
+            if (alreadyTried != null && alreadyTried.IsCombined)
+                seen.Add(KeyOf(alreadyTried.SongName, alreadyTried.SingerName));
+
+            for (var k = 1; k < parts.Count; k++)
+            {
+                var head = string.Join(" ", parts.GetRange(0, k).ToArray());
+                var tail = string.Join(" ", parts.GetRange(k, parts.Count - k).ToArray());
+
+                // 前 k 段当歌名、后段当歌手；以及反过来。
+                AddCandidate(candidates, seen, raw, head, tail);
+                AddCandidate(candidates, seen, raw, tail, head);
+            }
+
+            return candidates;
+        }
+
+        private static void AddCandidate(
+            List<SearchQuery> candidates,
+            HashSet<string> seen,
+            string raw,
+            string songName,
+            string singerName)
+        {
+            if (songName.Length == 0 || singerName.Length == 0) return;
+
+            if (!seen.Add(KeyOf(songName, singerName))) return;
+
+            candidates.Add(new SearchQuery
+            {
+                Raw = raw,
+                SongName = songName,
+                SingerName = singerName
+            });
+        }
+
+        /// <summary>
+        /// 去重键。用 <c>\u0001</c> 当分隔符：正常输入里不会出现，
+        /// 避免「AB C」和「A BC」这两种不同切分撞成同一个键。
+        /// </summary>
+        private static string KeyOf(string songName, string singerName)
+        {
+            return songName + "\u0001" + singerName;
         }
 
         private static List<string> SplitBySpace(string text)

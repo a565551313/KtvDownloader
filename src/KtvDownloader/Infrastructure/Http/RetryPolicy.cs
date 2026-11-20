@@ -36,19 +36,28 @@ namespace KtvDownloader.Infrastructure.Http
 
         /// <summary>
         /// 判断异常是否值得重试。网络层异常（连接断开、超时）都算。
+        /// <para>
+        /// <see cref="TaskCanceledException"/> 有两种来源，必须区分：
+        /// 1. 调用方主动取消 → 它自带的 token 已 canceled → **不能**重试；
+        /// 2. <c>HttpClient</c> 超时 → 它自带的 token 是 <c>None</c> → 应该重试。
+        /// </para>
         /// </summary>
         public static bool IsRetryable(Exception exception)
         {
             if (exception == null) return false;
 
+            var taskCanceled = exception as TaskCanceledException;
+            if (taskCanceled != null)
+                return !taskCanceled.CancellationToken.IsCancellationRequested;
+
             return exception is System.Net.Http.HttpRequestException
                 || exception is System.IO.IOException
                 || exception is System.Net.Sockets.SocketException
-                || exception is TaskCanceledException && !((TaskCanceledException)exception).CancellationToken.IsCancellationRequested;
+                || exception is System.Net.WebException;
         }
 
         /// <summary>
-        /// 计算第 N 次重试前的等待时长。指数退避：2s, 4s, 8s。
+        /// 计算第 N 次尝试失败后的等待时长。指数退避：2s, 4s, 8s（上限 16s）。
         /// </summary>
         public static TimeSpan GetDelay(int attempt)
         {
@@ -62,6 +71,16 @@ namespace KtvDownloader.Infrastructure.Http
         /// <param name="operation">要执行的操作，参数为尝试序号（从 1 开始）。</param>
         /// <param name="maxAttempts">最大尝试次数。</param>
         /// <param name="onRetry">每次重试前的回调，参数为（尝试序号, 失败原因）。</param>
+        /// <param name="cancellationToken">
+        /// 调用方的取消令牌。
+        /// <para>
+        /// ⚠️ 判断"该不该重试"时，只认这个令牌：
+        /// 早期版本写的是 <c>catch (OperationCanceledException) { throw; }</c>，
+        /// 而 <see cref="TaskCanceledException"/> 派生自它，
+        /// 于是 HttpClient 超时被当成用户取消直接抛出，
+        /// 下面 <see cref="IsRetryable(Exception)"/> 里那条超时分支永远走不到 —— CDN 抖动导致的超时从不重试。
+        /// </para>
+        /// </param>
         public static async Task<T> ExecuteAsync<T>(
             Func<int, Task<T>> operation,
             int maxAttempts = DefaultMaxAttempts,
@@ -81,20 +100,21 @@ namespace KtvDownloader.Infrastructure.Http
                 {
                     return await operation(attempt).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
                 catch (Exception ex)
                 {
+                    // 用户主动取消：立刻抛出，不重试。
+                    if (cancellationToken.IsCancellationRequested) throw;
+
+                    // 超时（TaskCanceledException 但令牌未取消）等瞬时故障：可以重试。
+                    if (!IsRetryable(ex)) throw;
+
                     lastException = ex;
 
-                    if (attempt >= attempts || !IsRetryable(ex)) throw;
+                    if (attempt >= attempts) throw;
 
-                    var delay = GetDelay(attempt);
                     if (onRetry != null) onRetry(attempt, ex.Message);
 
-                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(GetDelay(attempt), cancellationToken).ConfigureAwait(false);
                 }
             }
 

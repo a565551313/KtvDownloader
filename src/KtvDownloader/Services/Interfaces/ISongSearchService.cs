@@ -32,7 +32,14 @@ namespace KtvDownloader.Services.Interfaces
             int limit,
             CancellationToken cancellationToken = default(CancellationToken));
 
-        /// <summary>检索歌手。</summary>
+        /// <summary>
+        /// 检索歌手（返回歌手实体，不是歌曲）。
+        /// <para>
+        /// ⚠️ **当前没有 UI 入口**，是预留给"歌手选择列表"的（docs §10.2）。
+        /// 按歌手搜歌用的是 <see cref="SearchBySingerAsync"/>，别混。
+        /// 实现是好的、也走了索引，只是界面还没接。
+        /// </para>
+        /// </summary>
         Task<IReadOnlyList<Singer>> SearchSingersAsync(
             string keyword,
             int offset,
