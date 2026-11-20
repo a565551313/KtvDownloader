@@ -316,13 +316,23 @@ namespace KtvDownloader.Services
         {
             var outputDirectory = task.OutputDirectory;
 
-            // 不需要转码：直接把原始文件改成正式名。
-            if (!options.ConvertToMp4)
+            // ⚠️ 开了烧录就**不能**走"不转码直接改名"这条路：
+            // 那样水印会静默不生效 —— 界面上看不出任何异常，用户拿到手才发现文件是干净的。
+            // 烧录必须重编码，所以强制走 MP4 输出，并把这个覆盖行为记下来。
+            if (!options.ConvertToMp4 && !options.NeedsBurnIn)
             {
                 var finalPath = Path.Combine(outputDirectory,
                     safeBaseName + Path.GetExtension(sourcePath));
                 MoveOver(sourcePath, finalPath);
                 return finalPath;
+            }
+
+            if (!options.ConvertToMp4)
+            {
+                _logger.Warn("已开启叠加层烧录，本次忽略「不转码」设置，输出 MP4");
+                progress?.Report(new DownloadProgress(
+                    DownloadState.Converting, 0, null,
+                    "烧录叠加层需要重编码，本次输出 MP4"));
             }
 
             if (!_mediaService.IsFfmpegAvailable)
@@ -358,8 +368,12 @@ namespace KtvDownloader.Services
                     _logger.Info("音轨分离产出 " + produced.Length + " 个文件: " +
                                  string.Join(" | ", produced));
 
+                    await ApplyBurnInAsync(produced, options, progress, cancellationToken)
+                        .ConfigureAwait(false);
+
                     // 返回给队列的那一条要稳定：优先原唱版，没有再取伴奏版。
                     // 之前是 produced[0]，顺序取决于枚举实现，界面显示的成品路径会飘。
+                    // 烧录是原地替换（同名），所以这两个路径依然有效。
                     return split.OriginalPath ?? split.AccompanimentPath;
                 }
 
@@ -372,7 +386,136 @@ namespace KtvDownloader.Services
                 sourcePath, mp4Path, VocalOption.KeepBoth,
                 options.AudioBitrateKbps, cancellationToken).ConfigureAwait(false);
 
-            return converted ? mp4Path : null;
+            if (!converted) return null;
+
+            await ApplyBurnInAsync(new[] { mp4Path }, options, progress, cancellationToken)
+                .ConfigureAwait(false);
+
+            return mp4Path;
+        }
+
+        /// <summary>
+        /// 给已经产出的 MP4 逐个烧录叠加层（原地替换）。
+        /// <para>
+        /// <b>为什么做成后处理，而不是在转码时一次搞定：</b>
+        /// 第一步 TS → MP4 用的是 <c>-c:v copy</c>（视频不重编码，只是换容器），
+        /// 第二步才把视频解码、叠加、重编码一次。两步加起来视频<b>总共只编码一遍</b>，
+        /// 和"一步到位"的耗时一样；而且中间产物的音频已经是 AAC，
+        /// 第二步可以直接 <c>-c:a copy</c>，不会凭空多一代音频损失。
+        /// 更重要的是不用把 SplitVocal 那套音轨/声道逻辑再抄一遍。
+        /// </para>
+        /// <para>
+        /// ⚠️ <b>烧录失败不算下载失败。</b>用户等了几分钟把歌下下来，
+        /// 因为一张水印图被删了就整首丢掉，这个代价不对等。
+        /// 保留没烧录的成品 + 记 WARN + 在进度消息里说清楚，让他自己决定要不要重来。
+        /// </para>
+        /// </summary>
+        private async Task ApplyBurnInAsync(
+            string[] paths,
+            DownloadOptions options,
+            IProgress<DownloadProgress> progress,
+            CancellationToken cancellationToken)
+        {
+            if (paths == null || paths.Length == 0) return;
+            if (!options.NeedsBurnIn) return;
+
+            if (!_mediaService.IsFfmpegAvailable)
+            {
+                _logger.Warn("ffmpeg 不可用，跳过叠加层烧录");
+                return;
+            }
+
+            for (var i = 0; i < paths.Length; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var path = paths[i];
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) continue;
+
+                var index = i;
+                var burnProgress = new Progress<double>(percent =>
+                {
+                    progress?.Report(new DownloadProgress(
+                        DownloadState.Converting, (int)Math.Round(percent), null,
+                        string.Format("正在烧录叠加层 {0}/{1}　{2:0}%",
+                            index + 1, paths.Length, percent)));
+                });
+
+                // 先写到临时文件再换过去：直接写目标文件的话，中途失败会留下一个
+                // 半截的 MP4，把第一步产出的好文件也毁了。
+                var tempPath = path + ".burn.mp4";
+
+                try
+                {
+                    var result = await _mediaService.BurnInAsync(
+                        path, tempPath, options.Overlay, VocalOption.KeepBoth,
+                        options.AudioBitrateKbps, (IProgress<double>)burnProgress, 0, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    foreach (var warning in result.Warnings) _logger.Warn("叠加层: " + warning);
+
+                    // 警告不能只进日志：字体被兜底替换、某张图读不到被跳过，
+                    // 都意味着成品和用户以为的不一样。挑第一条塞进进度消息，
+                    // 界面上就看得见（全部塞进去会把状态栏挤爆）。
+                    var warningHint = result.Warnings.Count > 0
+                        ? "　⚠ " + result.Warnings[0]
+                        : string.Empty;
+
+                    if (result.NothingToBurn)
+                    {
+                        _logger.Info("叠加层无可渲染元素，保留原文件: " + result.Error);
+                        TryDelete(tempPath);
+                        continue;
+                    }
+
+                    if (!result.Success)
+                    {
+                        _logger.Warn("叠加层烧录失败，保留未烧录的成品: " + result.Error);
+                        progress?.Report(new DownloadProgress(
+                            DownloadState.Converting, 0, null,
+                            "叠加层烧录失败，已保留无水印版本" + warningHint));
+
+                        // ffmpeg 中途失败会留下一个半截的临时文件。不删的话
+                        // 用户的输出目录里会多出 song.mp4.burn.mp4 这种垃圾，
+                        // 而且它可能被曲库扫描当成一首歌捡进去。
+                        TryDelete(tempPath);
+                        continue;
+                    }
+
+                    // 音轨映射交给 BurnIn 内部按源文件实际情况处理，
+                    // 这里只负责把烧好的文件换到位。
+                    MoveOver(tempPath, path);
+                    _logger.Info("叠加层已烧录: " + path);
+
+                    if (warningHint.Length > 0)
+                    {
+                        progress?.Report(new DownloadProgress(
+                            DownloadState.Converting, 100, null, "叠加层已烧录" + warningHint));
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    TryDelete(tempPath);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn("叠加层烧录异常，保留未烧录的成品: " + ex.Message);
+                    TryDelete(tempPath);
+                }
+            }
+        }
+
+        private void TryDelete(string path)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("删除临时文件失败: " + path + " - " + ex.Message);
+            }
         }
 
         #endregion

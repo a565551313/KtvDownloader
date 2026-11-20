@@ -41,6 +41,24 @@ namespace KtvDownloader.Models
         /// <summary>是否在完成后删除中间 ts 文件。</summary>
         public bool DeleteIntermediateFiles { get; set; } = true;
 
+        /// <summary>
+        /// 叠加层配置（水印图片 / 文字卡片）。null 或未启用时不烧录。
+        /// <para>
+        /// 入队时快照一份，不要直接引用全局对象：批量下载可能跑几十分钟，
+        /// 期间用户在编辑器里改了配置，正在跑的任务不该跟着变。
+        /// </para>
+        /// <para>
+        /// ⚠️ 开启烧录会<b>强制输出 MP4</b>：烧录必须重编码视频，而 <c>.ts</c> 容器
+        /// 拿不到 <c>+faststart</c> 这类 MP4 的好处，音频也得退回 mp2。
+        /// <see cref="ConvertToMp4"/> 为 false 时由 <c>DownloadService</c> 覆盖并记日志。
+        /// </para>
+        /// </summary>
+        public OverlayComposition Overlay { get; set; }
+
+        /// <summary>这个任务是否需要烧录叠加层。</summary>
+        public bool NeedsBurnIn =>
+            Overlay != null && Overlay.Enabled && Overlay.BurnOnDownload && Overlay.HasAnyRenderable();
+
         /// <summary>创建一份默认选项的副本。</summary>
         public DownloadOptions Clone()
         {
@@ -51,7 +69,9 @@ namespace KtvDownloader.Models
                 Vocal = Vocal,
                 ConvertToMp4 = ConvertToMp4,
                 AudioBitrateKbps = AudioBitrateKbps,
-                DeleteIntermediateFiles = DeleteIntermediateFiles
+                DeleteIntermediateFiles = DeleteIntermediateFiles,
+                // 深拷贝：入队后用户改配置不该影响已经在跑的任务。
+                Overlay = Overlay == null ? null : Overlay.Clone()
             };
         }
     }

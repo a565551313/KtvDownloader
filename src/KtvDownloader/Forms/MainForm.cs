@@ -60,6 +60,17 @@ namespace KtvDownloader.Forms
         /// <summary>收藏存储。</summary>
         private FavoriteStore _favoriteStore;
 
+        /// <summary>叠加层配置存储（水印 / 片头卡片）。</summary>
+        private OverlayStore _overlayStore;
+
+        /// <summary>
+        /// 当前的叠加层配置。<b>全程只此一个实例</b>，编辑器保存后用
+        /// <see cref="OverlayComposition.ReplaceWith"/> 原地刷新 ——
+        /// 主窗体、预览窗体、下载选项拿到的都是它，换引用的话会出现
+        /// "设置里改了、预览没变"，而且每次重现的窗口还不一样。
+        /// </summary>
+        private OverlayComposition _overlayComposition;
+
         /// <summary>队列中的任务项与列表行的对应关系。</summary>
         private readonly Dictionary<Guid, ListViewItem> _queueItems = new Dictionary<Guid, ListViewItem>();
 
@@ -80,7 +91,69 @@ namespace KtvDownloader.Forms
 
             _favoriteStore = new FavoriteStore();
 
+            // 叠加配置读不出来时 Load 会返回一个未启用的空配置，不影响启动。
+            _overlayStore = new OverlayStore(null, _logger);
+            _overlayComposition = _overlayStore.Load();
+
+            if (_overlayComposition.Enabled)
+            {
+                _logger.Info(string.Format("叠加层已启用：{0} 个元素，烧录={1}",
+                    _overlayComposition.GetRenderableElements().Count,
+                    _overlayComposition.BurnOnDownload));
+            }
+
+            AddOverlayMenuItem();
+
             InitializeServices();
+        }
+
+        /// <summary>
+        /// 把「叠加层设置」加到文件菜单里。
+        /// <para>
+        /// 用代码加、不改 Designer：插到「设置」后面，位置固定，
+        /// 也不用在 Designer 里再声明一个字段、维护两处。
+        /// </para>
+        /// </summary>
+        private void AddOverlayMenuItem()
+        {
+            var item = new ToolStripMenuItem("叠加层设置（水印 / 片头）…");
+            item.Click += OnOverlayMenuClick;
+
+            var index = menuFile.DropDownItems.IndexOf(menuItemSettings);
+            menuFile.DropDownItems.Insert(index < 0 ? menuFile.DropDownItems.Count : index + 1, item);
+        }
+
+        /// <summary>
+        /// 从主窗体打开叠加层编辑器。
+        /// <para>
+        /// 这里没有正在播放的视频，所以「试烧样片」和「标记为当前播放位置」不可用 ——
+        /// 要做这两件事得从预览窗口的「叠加层…」按钮进去。
+        /// 宁可让按钮明确不可用，也不要点了之后给个含糊的错误。
+        /// </para>
+        /// </summary>
+        private void OnOverlayMenuClick(object sender, EventArgs e)
+        {
+            using (var editor = new OverlayEditorForm(
+                _overlayComposition, _overlayStore, _logger))
+            {
+                editor.ShowDialog(this);
+
+                if (!editor.Saved) return;
+
+                try
+                {
+                    _overlayComposition.ReplaceWith(_overlayStore.Load());
+                    UpdateStatus(_overlayComposition.Enabled
+                        ? string.Format("叠加层已启用，{0} 个元素",
+                            _overlayComposition.GetRenderableElements().Count)
+                        : "叠加层已关闭");
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn("重新载入叠加配置失败: " + ex.Message);
+                    UpdateStatus("叠加配置保存后重载失败：" + ex.Message);
+                }
+            }
         }
 
         /// <summary>
@@ -1368,17 +1441,14 @@ namespace KtvDownloader.Forms
             // 本地已有完整文件则直接播，跳过准备流程。
             var localPath = FindLocalFile(song);
 
-            var previewForm = new PreviewForm(
-                _logger, song, _previewService, _config.PreviewDurationSeconds);
-            previewForm.Show(this);
-
             if (localPath != null)
             {
-                previewForm.PlayLocalFile(localPath);
+                OpenPreviewForm(song, _config.PreviewDurationSeconds, localPath);
                 UpdateStatus("预览本地文件");
             }
             else
             {
+                OpenPreviewForm(song, _config.PreviewDurationSeconds, null);
                 UpdateStatus(_config.PreviewDurationSeconds == 0
                     ? "正在准备完整预览（需下载整首）"
                     : string.Format("正在准备预览（前 {0} 秒）", _config.PreviewDurationSeconds));
@@ -1495,8 +1565,50 @@ namespace KtvDownloader.Forms
                 Vocal = vocal,
                 ConvertToMp4 = chkConvertMp4.Checked,
                 AudioBitrateKbps = 192,
-                DeleteIntermediateFiles = true
+                DeleteIntermediateFiles = true,
+
+                // 入队时深拷贝一份（Clone 在 DownloadOptions.Clone 里做）：
+                // 批量下载可能跑几十分钟，期间用户改了配置，已经在跑的任务不该跟着变。
+                Overlay = _overlayComposition
             };
+        }
+
+        /// <summary>
+        /// 打开预览窗体。三处调用（搜索结果双击、队列双击、队列右键）都走这里。
+        /// <para>
+        /// <b>本地路径必须在 <c>Show()</c> 之前设好。</b>
+        /// 原来是先 <c>Show()</c> 再 <c>PlayLocalFile()</c>，而 <c>OnShown</c> 在
+        /// <c>Show()</c> 里就已经跑起来了 —— 那时 <c>_playablePath</c> 还是空的，
+        /// 于是它去走 <c>PrepareAndPlayAsync()</c>（下载 + 解密一段预览），
+        /// 紧接着 <c>PlayLocalFile</c> 又用本地文件启一次播放。
+        /// 磁盘上明明有完整文件，却白下一遍，两条播放路径还会互相覆盖。
+        /// </para>
+        /// <para>
+        /// 顺手补上生命周期：<c>Show()</c> 出来的窗体没人管 Dispose，
+        /// 而它握着 libVLC 实例和一个分层窗口，反复开关会把句柄攒起来。
+        /// </para>
+        /// </summary>
+        /// <param name="song">歌曲；为 null 时不打开。</param>
+        /// <param name="durationSeconds">预览时长（秒），0 = 完整预览。</param>
+        /// <param name="localPath">本地已有文件；非空时跳过下载直接播。</param>
+        private PreviewForm OpenPreviewForm(Song song, int durationSeconds, string localPath)
+        {
+            if (song == null || IsDisposed) return null;
+
+            var form = new PreviewForm(
+                _logger, song, _previewService, durationSeconds,
+                _overlayComposition, _overlayStore, _mediaService);
+
+            form.FormClosed += (sender, args) =>
+            {
+                var closing = sender as IDisposable;
+                if (closing != null) closing.Dispose();
+            };
+
+            if (!string.IsNullOrEmpty(localPath)) form.PlayLocalFile(localPath);
+
+            form.Show(this);
+            return form;
         }
 
         /// <summary>
@@ -1567,9 +1679,7 @@ namespace KtvDownloader.Forms
             if (task.State == DownloadState.Completed && !string.IsNullOrEmpty(task.OutputPath)
                 && File.Exists(task.OutputPath))
             {
-                var form = new PreviewForm(_logger, task.Song, _previewService);
-                form.PlayLocalFile(task.OutputPath);
-                form.Show(this);
+                OpenPreviewForm(task.Song, _config.PreviewDurationSeconds, task.OutputPath);
             }
             else if (task.State == DownloadState.Completed)
             {
@@ -1598,9 +1708,7 @@ namespace KtvDownloader.Forms
                 {
                     if (!string.IsNullOrEmpty(task.OutputPath) && File.Exists(task.OutputPath))
                     {
-                        var form = new PreviewForm(_logger, task.Song, _previewService);
-                        form.PlayLocalFile(task.OutputPath);
-                        form.Show(this);
+                        OpenPreviewForm(task.Song, _config.PreviewDurationSeconds, task.OutputPath);
                     }
                 });
 

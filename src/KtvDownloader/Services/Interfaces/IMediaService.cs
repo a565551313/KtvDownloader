@@ -26,6 +26,36 @@ namespace KtvDownloader.Services.Interfaces
         Task<int> CountAudioTracksAsync(string filePath, CancellationToken cancellationToken = default(CancellationToken));
 
         /// <summary>
+        /// 探测媒体信息（音轨数、分辨率、时长），三者来自同一次 <c>ffmpeg -i</c>，结果按路径缓存。
+        /// <para>烧录叠加层要靠它拿分辨率算坐标、拿时长算进度。</para>
+        /// </summary>
+        Task<MediaProbeResult> ProbeAsync(string filePath, CancellationToken cancellationToken = default(CancellationToken));
+
+        /// <summary>
+        /// 烧录叠加层（水印图片 / 文字卡片）并输出 MP4。
+        /// <para>
+        /// ⚠️ 与 <see cref="ConvertToMp4Async"/> 的代价不是一个量级：那边视频流拷贝、几秒完事，
+        /// 这边必须整首重编码，一首歌一两分钟起步。哪怕叠加只出现 5 秒也一样 ——
+        /// H.264 的帧间预测决定了每一帧都得解码再编码。
+        /// </para>
+        /// <para>
+        /// 没有任何可渲染元素时返回 <c>NothingToBurn = true</c>（<b>不是失败</b>），
+        /// 调用方应改走普通转码，别把这种情况报成下载失败。
+        /// </para>
+        /// </summary>
+        /// <param name="progress">0–100 百分比进度。</param>
+        /// <param name="sampleSeconds">&gt;0 时只烧前 N 秒（「试烧样片」），0 = 完整烧录。</param>
+        Task<BurnInResult> BurnInAsync(
+            string source,
+            string output,
+            OverlayComposition composition,
+            VocalOption vocal,
+            int audioBitrateKbps,
+            IProgress<double> progress,
+            int sampleSeconds = 0,
+            CancellationToken cancellationToken = default(CancellationToken));
+
+        /// <summary>
         /// 把 TS 转为 MP4。
         /// <para>
         /// 视频流原样拷贝（零画质损失），音频必须重编码为 AAC：
@@ -58,6 +88,38 @@ namespace KtvDownloader.Services.Interfaces
             int audioBitrateKbps,
             int accomp,
             CancellationToken cancellationToken = default(CancellationToken));
+    }
+
+    /// <summary>
+    /// 叠加层烧录结果。
+    /// </summary>
+    public sealed class BurnInResult
+    {
+        /// <summary>是否成功产出文件。</summary>
+        public bool Success { get; set; }
+
+        /// <summary>产出的文件路径，成功时非空。</summary>
+        public string OutputPath { get; set; }
+
+        /// <summary>失败原因；<see cref="NothingToBurn"/> 为 true 时是"跳过的原因"。</summary>
+        public string Error { get; set; }
+
+        /// <summary>
+        /// 没有可渲染的元素。<b>这不是错误</b> —— 调用方应改走普通转码路径。
+        /// 和 <see cref="Success"/> = false 一起出现，靠这个字段区分"该跳过"和"真失败"。
+        /// </summary>
+        public bool NothingToBurn { get; set; }
+
+        /// <summary>
+        /// 非致命警告：字体兜底、.ttc 风险、某个图片读不到尺寸被跳过、编码器回落等。
+        /// 这些都不影响产物，但用户该知道（尤其是字体被换掉 —— 成品字形和他选的不一样）。
+        /// </summary>
+        public System.Collections.Generic.List<string> Warnings { get; private set; }
+
+        public BurnInResult()
+        {
+            Warnings = new System.Collections.Generic.List<string>();
+        }
     }
 
     /// <summary>

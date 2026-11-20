@@ -201,6 +201,162 @@ namespace KtvDownloader.Services
                    + "k -movflags +faststart " + Quote(output);
         }
 
+        /// <summary>视频质量因子下限。</summary>
+        public const int MinVideoCrf = 0;
+
+        /// <summary>视频质量因子上限（再大就是纯粹的垃圾画质了）。</summary>
+        public const int MaxVideoCrf = 51;
+
+        /// <summary>把质量因子夹到合法区间。</summary>
+        public static int ClampVideoCrf(int crf)
+        {
+            return Math.Max(MinVideoCrf, Math.Min(MaxVideoCrf, crf));
+        }
+
+        /// <summary>
+        /// 视频编码器参数。
+        /// <para>
+        /// 软编（libx264）用 <c>-preset</c> + <c>-crf</c>；硬编各家吃的不一样，传错直接失败退出：
+        /// nvenc 认 <c>-cq</c>、qsv 认 <c>-global_quality</c>，两者都认 <c>-preset</c>。
+        /// 没列进来的编码器就只给 <c>-c:v</c>，用它自己的默认参数 —— 画质不可控，但至少能跑通。
+        /// </para>
+        /// </summary>
+        public static string BuildVideoEncoderOptions(string encoder, string preset, int crf)
+        {
+            var name = (encoder ?? string.Empty).Trim().ToLowerInvariant();
+            if (name.Length == 0) name = "libx264";
+
+            var quality = ClampVideoCrf(crf).ToString(CultureInfo.InvariantCulture);
+            var head = "-c:v " + name;
+
+            if (name.EndsWith("_nvenc", StringComparison.Ordinal))
+                return head + " -preset " + preset + " -cq " + quality;
+
+            if (name.EndsWith("_qsv", StringComparison.Ordinal))
+                return head + " -preset " + preset + " -global_quality " + quality;
+
+            if (FfmpegFilterText.IsHardwareEncoder(name))
+                return head;   // amf / videotoolbox / mf：不猜参数，用编码器默认值
+
+            return head + " -preset " + preset + " -crf " + quality;
+        }
+
+        /// <summary>
+        /// 烧录叠加层（水印图片 / 文字卡片）的转码参数。
+        /// <para>
+        /// 与 <see cref="BuildConvertToMp4Arguments"/> 的<b>根本区别</b>：那边视频是
+        /// <c>-c:v copy</c>（流拷贝，几秒完事），这边任何叠加都要求把视频<b>解码→绘制→重编码</b>，
+        /// 一首歌从几秒变成一两分钟甚至更久。H.264 的帧间预测决定了没有捷径 ——
+        /// 哪怕水印只出现 5 秒，也必须整首重编码。
+        /// </para>
+        /// <para>
+        /// 所有叠加元素必须合并进<b>同一次</b>调用（见 <see cref="OverlayFilterBuilder"/>）：
+        /// 分几趟做等于重编码几遍，时间按倍数涨，画质还多损失几代。
+        /// </para>
+        /// <para>
+        /// 加了 <c>-progress pipe:1</c>：重编码耗时长，没有进度上报的话队列项会长时间
+        /// 停在"正在转码"不动，看着像卡死。ffmpeg 会往 stdout 吐 <c>out_time_ms=</c>
+        /// （<b>单位其实是微秒</b>，这是 ffmpeg 的老命名坑）和 <c>progress=continue|end</c>。
+        /// </para>
+        /// </summary>
+        /// <param name="plan">渲染计划，含滤镜图、图片输入顺序、待写文本文件。</param>
+        /// <param name="sampleSeconds">
+        /// &gt;0 时只烧前 N 秒（「试烧样片」用，几秒就能验证效果）。
+        /// 0 表示完整烧录。
+        /// </param>
+        /// <param name="copyAudio">
+        /// 音频是否直接流拷贝。<b>仅当源的音频已经是 AAC 时才可以传 true</b>：
+        /// 源是 TS 时音轨是 mp2，copy 进 MP4 会被标成 mp3，
+        /// 多数播放器解不出来，表现为"画面正常但完全没声音"（docs 坑1）。
+        /// </param>
+        public static string BuildBurnInArguments(
+            string source,
+            string output,
+            OverlayRenderPlan plan,
+            VocalOption vocal,
+            int audioTrackCount,
+            int audioBitrateKbps,
+            string videoEncoder,
+            string videoPreset,
+            int videoCrf,
+            int sampleSeconds,
+            bool copyAudio)
+        {
+            if (plan == null || plan.IsEmpty || string.IsNullOrEmpty(plan.FilterComplex))
+                throw new ArgumentException("渲染计划为空，不应走烧录路径", nameof(plan));
+
+            var builder = new StringBuilder();
+            builder.Append("-y -hide_banner");
+
+            // 试烧样片：-t 放在 -i **之前**才是输入选项（限制读取时长），
+            // 放在后面会变成输出选项 —— 那样 ffmpeg 会把整首解码完再截断，慢得多。
+            if (sampleSeconds > 0)
+            {
+                builder.Append(" -t ")
+                       .Append(sampleSeconds.ToString(CultureInfo.InvariantCulture));
+            }
+
+            builder.Append(" -i ").Append(Quote(source));
+
+            // 图片输入按渲染计划里的顺序追加，滤镜图用 [1:v]、[2:v]… 引用它们。
+            // ⚠️ 不需要 -loop 1：图片输入只有一帧，overlay 默认 repeatlast=1 会把它
+            //    一直保持到主视频结束，这正是我们要的。加了 -loop 1 反而变成无限输入，
+            //    还得配 -shortest，凭空多一个失败点。
+            foreach (var image in plan.ImageInputs)
+            {
+                builder.Append(" -i ").Append(Quote(image));
+            }
+
+            builder.Append(" -filter_complex ").Append(Quote(plan.FilterComplex));
+
+            // 视频走滤镜图的输出标签，不能再写 0:v（那条流已经被滤镜消费掉了）。
+            builder.Append(" -map ").Append(Quote("[" + plan.OutputLabel + "]"));
+
+            if (audioTrackCount >= 2)
+            {
+                switch (vocal)
+                {
+                    case VocalOption.OriginalOnly:
+                        builder.Append(" -map 0:a:0");
+                        break;
+                    case VocalOption.AccompanimentOnly:
+                        builder.Append(" -map 0:a:1");
+                        break;
+                    default:
+                        builder.Append(" -map 0:a:0 -map 0:a:1");
+                        break;
+                }
+            }
+            else if (audioTrackCount == 1)
+            {
+                builder.Append(" -map 0:a:0");
+            }
+
+            builder.Append(' ').Append(BuildVideoEncoderOptions(videoEncoder, videoPreset, videoCrf));
+            builder.Append(" -pix_fmt yuv420p");
+
+            if (audioTrackCount <= 0)
+            {
+                builder.Append(" -an");
+            }
+            else if (copyAudio)
+            {
+                builder.Append(" -c:a copy");
+            }
+            else
+            {
+                builder.Append(" -c:a aac -b:a ")
+                       .Append(ClampBitrate(audioBitrateKbps).ToString(CultureInfo.InvariantCulture))
+                       .Append("k -ac 2");
+            }
+
+            builder.Append(" -movflags +faststart");
+            builder.Append(" -progress pipe:1");
+            builder.Append(' ').Append(Quote(output));
+
+            return builder.ToString();
+        }
+
         /// <summary>
         /// 预览转码参数：裁前 N 秒、视频流拷贝、音频转 AAC、fMP4 分片（可边下边播）。
         /// </summary>

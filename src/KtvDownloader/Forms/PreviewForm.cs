@@ -4,6 +4,8 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using KtvDownloader.Controls;
+using KtvDownloader.Infrastructure.Config;
 using KtvDownloader.Infrastructure.Logging;
 using KtvDownloader.Infrastructure.Media;
 using KtvDownloader.Models;
@@ -64,6 +66,26 @@ namespace KtvDownloader.Forms
         private const int SingleTrackConfirmHits = 3;
 
         /// <summary>音量（0-100）。</summary>
+        // ── 叠加层（水印 / 片头卡片）──────────────────────────────
+        //
+        // 预览时叠加层是"软"的：GDI+ 画在一个分层窗口上盖住画面，
+        // 不动视频文件、不重编码，所以"首屏接近 0 秒"这个特性完全不受影响。
+        // 真正烧进文件只发生在下载（DownloadService.ApplyBurnInAsync）。
+
+        /// <summary>叠加配置。为 null 表示调用方没启用这个功能。</summary>
+        private readonly OverlayComposition _composition;
+
+        /// <summary>叠加配置的存储，编辑器保存后用它把新配置读回来。</summary>
+        private readonly OverlayStore _overlayStore;
+
+        /// <summary>媒体服务，供编辑器"试烧样片"用。为 null 时该按钮不可用。</summary>
+        private readonly IMediaService _mediaService;
+
+        private OverlayLayeredWindow _overlayWindow;
+        private Button _btnOverlay;
+        private bool _overlayVideoSizeKnown;
+        private bool _overlayHooksAttached;
+
         private int _volume = 80;
 
         /// <summary>进度刷新定时器。</summary>
@@ -75,12 +97,26 @@ namespace KtvDownloader.Forms
         /// <summary>媒体总时长（毫秒）。</summary>
         private long _mediaLength;
 
-        public PreviewForm(ILogger logger, Song song, IPreviewService previewService, int durationSeconds = 60)
+        /// <param name="durationSeconds">预览时长（秒），0 表示完整预览。</param>
+        /// <param name="composition">叠加配置；传 null 则完全不启用叠加层。</param>
+        /// <param name="overlayStore">叠加配置的存储，编辑器要用它保存。</param>
+        /// <param name="mediaService">媒体服务，编辑器的"试烧样片"要用。</param>
+        public PreviewForm(
+            ILogger logger,
+            Song song,
+            IPreviewService previewService,
+            int durationSeconds = 60,
+            OverlayComposition composition = null,
+            OverlayStore overlayStore = null,
+            IMediaService mediaService = null)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _previewService = previewService ?? throw new ArgumentNullException(nameof(previewService));
             _song = song;
             _durationSeconds = durationSeconds;
+            _composition = composition;
+            _overlayStore = overlayStore;
+            _mediaService = mediaService;
 
             InitializeComponent();
 
@@ -93,6 +129,40 @@ namespace KtvDownloader.Forms
             cboVocalMode.Items.Add("伴奏");
             cboVocalMode.SelectedIndex = 0;
             cboVocalMode.Enabled = false;
+
+            AddOverlayButton();
+        }
+
+        /// <summary>
+        /// 加「叠加层」按钮。
+        /// <para>
+        /// 用代码加、不改 Designer：<c>panelTop</c> 里的 <c>lblStatus</c> 是
+        /// <c>Dock = Fill</c>，再塞一个 <c>Dock = Right</c> 的按钮进去，
+        /// 布局引擎会自动让状态标签缩短，不会和现有控件重叠。
+        /// 手写绝对坐标的话，窗口一拉宽就会撞上。
+        /// </para>
+        /// </summary>
+        private void AddOverlayButton()
+        {
+            _btnOverlay = new Button
+            {
+                Text = "叠加层…",
+                Dock = DockStyle.Right,
+                Width = 96,
+                FlatStyle = FlatStyle.Flat,
+                TabStop = false
+            };
+            _btnOverlay.Click += OnOverlayButtonClick;
+
+            // Dock=Right 的控件要排在 Fill 之前处理，所以插到集合最前面。
+            panelTop.Controls.Add(_btnOverlay);
+            _btnOverlay.BringToFront();
+
+            if (_composition == null)
+            {
+                // 没传配置就说明调用方没启用这个功能，别放一个点了没反应的按钮在那儿。
+                _btnOverlay.Visible = false;
+            }
         }
 
         /// <summary>
@@ -213,6 +283,7 @@ namespace KtvDownloader.Forms
 
                 StartProgressTimer();
                 StartAudioProbe();
+                StartOverlay();
             }
             catch (Exception ex)
             {
@@ -450,6 +521,9 @@ namespace KtvDownloader.Forms
             // 停止后 IsPlaying/GetLength 都失效，再探测也拿不到结论，直接停掉。
             StopAudioProbe();
 
+            // 画面没了，盖在上面的分层窗口也必须收起来，否则会在黑屏上留一块残影。
+            StopOverlay();
+
             _player.Stop();
             if (_progressTimer != null) _progressTimer.Stop();
             trackSeek.Value = 0;
@@ -488,6 +562,8 @@ namespace KtvDownloader.Forms
                 }
 
                 var position = _player.GetTime();
+
+                UpdateOverlay(position);
 
                 if (_mediaLength > 0)
                 {
@@ -593,6 +669,203 @@ namespace KtvDownloader.Forms
             }
         }
 
+        #region 叠加层（水印 / 片头卡片）
+
+        /// <summary>
+        /// 开始显示叠加层。
+        /// <para>
+        /// 用的是<b>分层窗口</b>而不是透明控件：视频是 libVLC 直接往原生 HWND 上画的，
+        /// WinForms 的 <c>BackColor = Transparent</c> 靠"让父控件先画背景"来模拟，
+        /// 放在 <c>panelVideo</c> 里露出来的是黑底、放在外面露出来的是窗体背景，
+        /// 两种都盖不出画面。只有 <c>WS_EX_LAYERED</c> + <c>UpdateLayeredWindow</c>
+        /// 能把 ARGB 位图真正按像素透明地合成到视频上面。
+        /// </para>
+        /// </summary>
+        private void StartOverlay()
+        {
+            if (_composition == null || !_composition.Enabled || !_composition.ShowInPreview) return;
+            if (_composition.GetRenderableElements().Count == 0) return;
+            if (IsDisposed) return;
+
+            try
+            {
+                if (_overlayWindow == null || _overlayWindow.IsDisposed)
+                {
+                    _overlayWindow = new OverlayLayeredWindow
+                    {
+                        Composition = _composition,
+                        VideoWidth = 1280,
+                        VideoHeight = 720
+                    };
+
+                    // Owner 让它始终浮在预览窗体之上，但不会跑到别的应用前面去。
+                    _overlayWindow.Show(this);
+                }
+
+                if (!_overlayHooksAttached)
+                {
+                    // 分层窗口是独立的顶层窗口，不会跟着 panelVideo 自动移动，
+                    // 这三个事件缺一个，用户一拖窗口或一缩放叠加层就会留在原地。
+                    panelVideo.SizeChanged += OnHostLayoutChanged;
+                    Move += OnHostLayoutChanged;
+                    Resize += OnHostLayoutChanged;
+                    _overlayHooksAttached = true;
+                }
+
+                _overlayVideoSizeKnown = false;
+                RepositionOverlay();
+            }
+            catch (Exception ex)
+            {
+                // 叠加层只是锦上添花，失败不该影响播放本身。
+                _logger.Warn("启动叠加层失败: " + ex.Message);
+                StopOverlay();
+            }
+        }
+
+        /// <summary>
+        /// 每一拍进度更新叠加层：补上视频尺寸、按当前时刻过滤时间窗口、重新定位。
+        /// <para>
+        /// ⚠️ 视频尺寸要反复问、不能问一次就放弃：和音轨探测是同一类问题 ——
+        /// libVLC 解 TS 是异步的，刚开始播放那几拍 <c>libvlc_video_get_size</c> 常常失败。
+        /// 拿到一次就够了，之后不再问。
+        /// </para>
+        /// </summary>
+        private void UpdateOverlay(long positionMilliseconds)
+        {
+            if (_overlayWindow == null || _overlayWindow.IsDisposed) return;
+
+            try
+            {
+                if (!_overlayVideoSizeKnown)
+                {
+                    int width, height;
+                    if (_player != null && _player.TryGetVideoSize(out width, out height))
+                    {
+                        _overlayWindow.VideoWidth = width;
+                        _overlayWindow.VideoHeight = height;
+                        _overlayVideoSizeKnown = true;
+                        RepositionOverlay();
+                    }
+                }
+
+                _overlayWindow.CurrentTimeSeconds = positionMilliseconds / 1000.0;
+
+                // 尺寸变化会让画面区域跟着变（比如从 480p 切到 720p 的片源），
+                // 所以拿到尺寸之后每拍仍然对齐一次，成本就是几次整数运算。
+                if (_overlayVideoSizeKnown) RepositionOverlay();
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("更新叠加层失败: " + ex.Message);
+            }
+        }
+
+        private void RepositionOverlay()
+        {
+            if (_overlayWindow == null || _overlayWindow.IsDisposed) return;
+
+            // 最小化时视频区域是 0，留着窗口会在任务栏附近糊一块东西。
+            if (WindowState == FormWindowState.Minimized || !Visible)
+            {
+                if (_overlayWindow.Visible) _overlayWindow.Hide();
+                return;
+            }
+
+            _overlayWindow.Reposition(panelVideo);
+        }
+
+        private void OnHostLayoutChanged(object sender, EventArgs e)
+        {
+            RepositionOverlay();
+        }
+
+        /// <summary>
+        /// 收起叠加层。
+        /// <para>
+        /// 必须在关窗和停止播放时都调：这是个独立的顶层窗口，
+        /// 不会随预览窗体自动消失，漏掉就会在桌面上留一块残影。
+        /// </para>
+        /// </summary>
+        private void StopOverlay()
+        {
+            if (_overlayHooksAttached)
+            {
+                try
+                {
+                    panelVideo.SizeChanged -= OnHostLayoutChanged;
+                    Move -= OnHostLayoutChanged;
+                    Resize -= OnHostLayoutChanged;
+                }
+                catch (Exception)
+                {
+                    // 控件已经在销毁中，解绑失败无所谓。
+                }
+
+                _overlayHooksAttached = false;
+            }
+
+            if (_overlayWindow != null)
+            {
+                try
+                {
+                    _overlayWindow.Shutdown();
+
+                    // Owner 关系会让它跟预览窗体一起 Dispose，但保险起见自己先放掉引用。
+                    if (!_overlayWindow.IsDisposed) _overlayWindow.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn("关闭叠加层失败: " + ex.Message);
+                }
+
+                _overlayWindow = null;
+            }
+
+            _overlayVideoSizeKnown = false;
+        }
+
+        /// <summary>打开叠加层编辑器。从预览窗口打开才能"试烧样片"和"标记当前播放位置"。</summary>
+        private void OnOverlayButtonClick(object sender, EventArgs e)
+        {
+            if (_composition == null) return;
+
+            using (var editor = new OverlayEditorForm(
+                _composition,
+                _overlayStore,
+                _logger,
+                _mediaService,
+                _playablePath,
+                () => _player == null ? 0 : _player.GetTime() / 1000.0))
+            {
+                editor.ShowDialog(this);
+
+                if (!editor.Saved || _overlayStore == null) return;
+
+                // 编辑器改的是副本并且已经存盘，这里把新配置读回来**原地**替换，
+                // 这样主窗体持有的同一个实例也立刻看到新配置（下一次下载就生效）。
+                try
+                {
+                    _composition.ReplaceWith(_overlayStore.Load());
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn("重新载入叠加配置失败: " + ex.Message);
+                    return;
+                }
+
+                // 配置可能从"关"变成"开"、也可能新增了元素，所以整套重来一遍。
+                StopOverlay();
+                StartOverlay();
+
+                lblStatus.Text = _composition.Enabled && _composition.ShowInPreview
+                    ? "叠加层已更新"
+                    : "叠加层已关闭";
+            }
+        }
+
+        #endregion
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             if (_cts != null)
@@ -606,6 +879,9 @@ namespace KtvDownloader.Forms
             // 它每 300ms 拍一次，若留到 player 已 Dispose 之后才触发，
             // OnAudioProbeTick 里就是 NullReferenceException。
             StopAudioProbe();
+
+            // 叠加层是独立的顶层窗口，不会跟着预览窗体自动消失，必须显式收掉。
+            StopOverlay();
 
             if (_progressTimer != null)
             {

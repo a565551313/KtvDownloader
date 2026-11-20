@@ -91,6 +91,9 @@ msbuild KtvDownloader.sln -t:restore;build -p:Configuration=Release -p:Platform=
 - **下载**：多选批量入队，每首歌独立进度；队列右键可取消、打开所在目录、收藏
 - **收藏**：搜索结果或队列右键 →「添加收藏 / 取消收藏」，按歌号存本地，曲库更新后依然有效
 - **曲库更新**：`工具 → 检查更新`，带进度与取消
+- **叠加层**：`文件 → 叠加层设置（水印 / 片头）`，往画面上叠台标图片或文字卡片，
+  可拖动定位、九宫格预设、指定出现/消失的时间段（例：`0:10` 出现、`0:15` 消失）。
+  **预览时只是叠在上面看效果，不改动文件；只有下载时才真烧进视频**
 
 ## 目录结构
 
@@ -100,7 +103,7 @@ KtvDownloader/
 ├── .editorconfig                 # 代码规范（VS 自动应用）
 ├── .gitignore
 ├── README.md
-├── docs/技术交接文档.md           # 交接文档（接口清单 / 13 个坑 / API 说明）
+├── docs/技术交接文档.md           # 交接文档（接口清单 / 17 个坑 / API 说明）
 ├── scripts/
 │   ├── build.ps1                 # 构建（vswhere 定位 MSBuild + 处理坑13）
 │   └── run-tests.ps1             # 构建 + 跑单元测试
@@ -112,8 +115,10 @@ KtvDownloader/
 │   ├── Forms/                    # 窗体（.cs + .Designer.cs 分离）
 │   │   ├── MainForm.cs           # 主界面
 │   │   ├── PreviewForm.cs        # 预览播放（libVLC）
+│   │   ├── OverlayEditorForm.cs  # 叠加层编辑器（纯代码构建，无 Designer）
 │   │   ├── SettingsForm.cs / PlaylistForm.cs / CategoryForm.cs / DatabaseUpdateForm.cs
 │   ├── Controls/                 # BrowseToolBar / PaginationBar / PaginationMath
+│   │                             # OverlayRenderer / OverlayDesignSurface / OverlayLayeredWindow
 │   ├── Models/                   # 纯数据模型（Song / DownloadTask / AppConfig ...）
 │   ├── Services/
 │   │   ├── Interfaces/           # 服务契约
@@ -127,13 +132,17 @@ KtvDownloader/
 │   │   ├── SearchQuery                                # 「歌名 歌手」解析
 │   │   ├── SongFileNaming                             # 产物命名规则（写入与反查共用）
 │   │   ├── VocalChannelRule                           # 单音轨卡拉OK左右声道规则（下载/预览共用）
-│   │   └── SingerNameLookup                           # 批量补歌手名
+│   │   ├── SingerNameLookup                           # 批量补歌手名
+│   │   ├── OverlayGeometry / OverlayFilterBuilder     # 叠加层定位与滤镜图（预览/烧录共用）
+│   │   ├── FfmpegFilterText / FfmpegProgressParser    # 滤镜转义 / -progress 解析
+│   │   ├── OverlayAssetResolver / FontFileResolver    # 读图片尺寸 / 字体名→字体文件
+│   │   └── OverlayTextPresets                         # KTV 文字样式预设
 │   └── Infrastructure/
 │       ├── Http/                 # CleanHttpClient（防风控裸 Socket）/ RetryPolicy / HttpResult
 │       ├── Media/VlcMediaPlayer  # libVLC 封装
 │       ├── Security/RsaPkcs1Encryptor
 │       ├── Config/               # ConfigStore / MiniJson / ProtocolCredentials /
-│       │                         # DatabasePathResolver / FavoriteStore
+│       │                         # DatabasePathResolver / FavoriteStore / OverlayStore
 │       ├── Logging/              # FileLogger（缓冲写 + 级别过滤）/ LogLevel
 │       └── Extensions/CommonExtensions
 ├── tests/KtvDownloader.Tests/    # MSTest 单元测试
@@ -252,6 +261,51 @@ libVLC 原生支持 MPEG-TS + mp2，解密后的 `.ts` 可以直接播，
 
 预览片段会缓存复用，缓存目录有容量上限（512MB / 200 个文件），超出自动淘汰最久未用的。
 
+### 7. 叠加层：预览是"软"的，下载才真烧
+
+水印图片和片头文字卡片是**同一个东西**，只是时间窗口不同：
+台标不设窗口 = 全程显示，片头卡片设成 `[0, 5]`，片尾致谢设成 `[55, 60]`。
+正片画面照常播、正片声音照常放，卡片只是叠在上面。
+
+**预览时不碰视频文件**：GDI+ 把配置画到一张位图上，用 `UpdateLayeredWindow`
+合成到视频上方（`Controls/OverlayLayeredWindow.cs`）。
+这里不能用普通透明控件 —— WinForms 的 `BackColor = Transparent` 是靠
+"让父控件先画背景"模拟的，而 libVLC 是直接往 `panelVideo` 的原生 HWND 上画的，
+不经过它的 `Paint`，于是透明区域只会露出黑色（docs 坑 14）。
+
+**下载时才真烧**：在**已经产出的 MP4** 上再过一遍 ffmpeg。
+第一步 TS → MP4 用 `-c:v copy`（视频不重编码，只换容器），音频 mp2 → AAC；
+第二步才把视频解码、叠加、重编码一次，而因为中间产物已经是 AAC，音频直接 `-c:a copy`。
+两步加起来视频**总共只编码一遍**，和"一步到位"耗时相同，还省掉一代音频损失。
+
+> ⚠️ **烧录 = 整首重编码。** 哪怕水印只出现 5 秒，H.264 的帧间预测也决定了
+> 每一帧都要解码再编码。一首 4 分钟 720p 的歌，`libx264 -preset veryfast`
+> 大概 1–3 分钟（对比原来的几秒）。批量烧录时建议把并发数降到 1。
+>
+> ⚠️ **烧录失败不算下载失败。** 保留没烧录的成品 + 记 WARN + 在进度消息里说清楚。
+> 用户等了几分钟把歌下下来，因为一张水印图被删了就整首丢掉，这个代价不对等。
+
+坐标只有 `Services/OverlayGeometry.cs` **一个来源**，预览和烧录都调它 ——
+两边各算一套迟早出现"预览在右上角、烧出来跑到中间"。
+所有像素尺寸都以 **720p 为基准**存储，渲染时按实际视频高度等比缩放，
+这样同一份配置在 480p / 720p / 1080p 的片源上看起来一致。
+
+文字**刻意不走转义**：落到临时文件由 `drawtext=textfile=` 读，配 `expansion=none`，
+于是 `:` `'` `%` `\` 都不需要处理（docs 坑 15）。临时文件必须 UTF-8 无 BOM、换行必须是 LF，
+否则每行末尾会渲染出一个豆腐块。
+
+> **不承诺像素级所见即所得。** 预览用 GDI+ 排版、成品用 libfreetype，
+> 字距和描边会有几个像素的差（ffmpeg 的 `borderw` 只向外扩，GDI+ 的 pen 以路径为中心线，
+> 所以预览用 `pen.Width = 2 × borderw` 去对齐）。
+> 界面上给了「**试烧样片**」：`-t N` 真跑一遍 ffmpeg，几秒出一个小样片，
+> 用户自己确认效果再批量下载。样片时长会自动覆盖到最后一个时间窗口的结束点，
+> 否则用户设了"10–15 秒"的片头、样片只烧前 5 秒，什么都看不到，会以为功能坏了。
+
+配置存在 `%AppData%\KtvDownloader\overlay.jsonl`，**一行一个元素**（扁平 JSON）。
+不用 `config.json` 是因为 `MiniJson` 只解析扁平键值对，要存数组套对象就得给它加递归解析 ——
+而它在 ConfigStore、曲库更新、取址协议里到处在用，改坏了影响面太大。
+附带好处是用户能拿记事本直接改，`#` 开头是注释。
+
 ## 测试
 
 `tests/KtvDownloader.Tests/` 是 MSTest 工程，只测**纯逻辑**，不连曲库、不联网、不播放：
@@ -268,6 +322,10 @@ libVLC 原生支持 MPEG-TS + mp2，解密后的 `.ts` 可以直接播，
 | `FileLoggerTests` | 级别过滤、ERROR 立刻落盘、并发写不丢行 |
 | `SearchQueryTests` | 「歌手 歌名」写反能纠正、候选去重（少查几次库） |
 | `PaginationMathTests` | 总数未知时不让用户跳到编出来的页码 |
+| `VocalChannelRuleTests` | 单音轨切声道时左右不能弄反、伴奏轨未知时的猜测要带提示 |
+| `OverlayGeometryTests` | 预览与烧录算出同一套坐标、720p 基准缩放往返不漂、拖拽反解回锚点+边距、时间窗口是闭区间 |
+| `OverlayFilterBuilderTests` | `enable` 必须带单引号、图片支链在前主干在后、文本走 `textfile` 不转义、构建器不许改传入的配置 |
+| `OverlayPipelineTests` | 烧录命令行的音轨映射与 `-t` 位置、`out_time_ms` 其实是微秒、探测不到流信息绝不能当"没有音轨"、配置往返 |
 
 跑测试：
 
@@ -280,8 +338,9 @@ libVLC 原生支持 MPEG-TS + mp2，解密后的 `.ts` 可以直接播，
 > 32 位宿主加载会直接 `BadImageFormatException`。脚本与 CI 都已带上 `/Platform:x64`。
 
 主工程通过 `Properties/AssemblyInfo.cs` 里的 `InternalsVisibleTo("KtvDownloader.Tests")`
-开放了几处测试钩子（解密签名与密钥、预览缓存键、歌手名归一化），
-这样测试不必去连真曲库、真源站。
+开放了几处测试钩子（解密签名与密钥、预览缓存键、歌手名归一化、
+`ffmpeg -i` 输出解析、样片时长建议），这样测试不必去连真曲库、真源站，
+**也不必装 ffmpeg** —— 探测解析和滤镜图构建都是纯函数，喂字符串进去就能验。
 
 ## 持续集成
 
@@ -305,6 +364,7 @@ libVLC 原生支持 MPEG-TS + mp2，解密后的 `.ts` 可以直接播，
 |---|---|---|
 | `config.json` | `%AppData%\KtvDownloader\` | 主配置，原子写入 |
 | `favorites.txt` | `%AppData%\KtvDownloader\` | 收藏的歌号，一行一个 |
+| `overlay.jsonl` | `%AppData%\KtvDownloader\` | 叠加层配置（水印 / 片头卡片），一行一个元素，原子写入。`#` 开头是注释，可用记事本直接改 |
 | `credentials.json` | `%AppData%\KtvDownloader\` | 可选，覆盖端点/appid/设备号等（不存在则用内置默认值） |
 | `preview-cache/` | `%AppData%\KtvDownloader\` | 预览片段缓存，自动淘汰 |
 
